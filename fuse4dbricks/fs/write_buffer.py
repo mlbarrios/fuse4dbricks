@@ -5,6 +5,8 @@ Tempfile-backed write buffer for a single open writable file handle.
 import os
 import tempfile
 
+import trio
+
 
 class WriteBuffer:
     """
@@ -14,30 +16,52 @@ class WriteBuffer:
     regardless of file size — a 50 GB CRAM costs the same RAM as a 1 KB file.
     The buffer also supports read() so O_RDWR handles can serve reads from the
     local copy (which reflects in-progress writes) rather than from DataManager.
+
+    All file I/O is offloaded via ``trio.to_thread.run_sync``, the same pattern
+    ``storage/persistence.py`` uses for its own disk operations: every FUSE
+    request in this process runs as a cooperatively-scheduled trio task on a
+    single OS thread, so an un-awaited blocking call here would stall every
+    other concurrent request in the mount, not just the file being written
+    (see docs/performance/P12-analysis.md).
     """
 
-    def __init__(self, writes_dir: str, initial_data: bytes = b""):
-        self._tmp = tempfile.NamedTemporaryFile(
-            delete=False, prefix="fuse4dbricks_write_", dir=writes_dir
-        )
-        self._size: int = 0
-        if initial_data:
-            self._tmp.write(initial_data)
-            self._size = len(initial_data)
+    def __init__(self, tmp: "tempfile._TemporaryFileWrapper", size: int):
+        """Not awaitable; use :meth:`create` to construct an instance."""
+        self._tmp = tmp
+        self._size = size
 
-    def write(self, offset: int, data: bytes) -> int:
+    @classmethod
+    async def create(cls, writes_dir: str, initial_data: bytes = b"") -> "WriteBuffer":
+        tmp = await trio.to_thread.run_sync(
+            lambda: tempfile.NamedTemporaryFile(
+                delete=False, prefix="fuse4dbricks_write_", dir=writes_dir
+            )
+        )
+        size = 0
+        if initial_data:
+            await trio.to_thread.run_sync(tmp.write, initial_data)
+            size = len(initial_data)
+        return cls(tmp, size)
+
+    def _write_at(self, offset: int, data: bytes) -> None:
         self._tmp.seek(offset)
         self._tmp.write(data)
+
+    def _read_at(self, offset: int, length: int) -> bytes:
+        self._tmp.seek(offset)
+        return self._tmp.read(length)
+
+    async def write(self, offset: int, data: bytes) -> int:
+        await trio.to_thread.run_sync(self._write_at, offset, data)
         end = offset + len(data)
         if end > self._size:
             self._size = end
         return len(data)
 
-    def read(self, offset: int, length: int) -> bytes:
-        self._tmp.seek(offset)
-        return self._tmp.read(length)
+    async def read(self, offset: int, length: int) -> bytes:
+        return await trio.to_thread.run_sync(self._read_at, offset, length)
 
-    def truncate(self, size: int) -> None:
+    async def truncate(self, size: int) -> None:
         """Resize the buffer to exactly ``size`` bytes.
 
         Shrinks (dropping the tail) or grows (zero-filling, POSIX hole
@@ -45,10 +69,10 @@ class WriteBuffer:
         before resizing, so a subsequent ``read``/``finalize`` sees the new
         length.
         """
-        self._tmp.truncate(size)
+        await trio.to_thread.run_sync(self._tmp.truncate, size)
         self._size = size
 
-    def flush_to_disk(self) -> None:
+    async def flush_to_disk(self) -> None:
         """Push buffered writes to the OS so a separate reader sees them.
 
         Like ``finalize()`` this makes the full content visible to the upload's
@@ -59,9 +83,9 @@ class WriteBuffer:
         writes in between. Idempotent; a no-op once the handle is closed.
         """
         if not self._tmp.closed:
-            self._tmp.flush()
+            await trio.to_thread.run_sync(self._tmp.flush)
 
-    def finalize(self) -> None:
+    async def finalize(self) -> None:
         """Flush and close the write handle, keeping the file on disk.
 
         Writes go through a buffered file object, so data may sit in Python's
@@ -74,7 +98,7 @@ class WriteBuffer:
         ``write()`` must not be called afterwards.
         """
         if not self._tmp.closed:
-            self._tmp.close()
+            await trio.to_thread.run_sync(self._tmp.close)
 
     def size(self) -> int:
         return self._size
@@ -83,14 +107,14 @@ class WriteBuffer:
     def path(self) -> str:
         return self._tmp.name
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Close the handle (if still open) and delete the tempfile. Always
         call this, even on error. Safe to call after ``finalize()``."""
         try:
             if not self._tmp.closed:
-                self._tmp.close()
+                await trio.to_thread.run_sync(self._tmp.close)
         finally:
             try:
-                os.unlink(self._tmp.name)
+                await trio.to_thread.run_sync(os.unlink, self._tmp.name)
             except OSError:
                 pass

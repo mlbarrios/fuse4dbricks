@@ -382,7 +382,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         write_buffer: WriteBuffer | None = None
 
         if writable and self._dispatch(entry.fs_path) == "unity_catalog":
-            write_buffer = WriteBuffer(self._writes_dir)
+            write_buffer = await WriteBuffer.create(self._writes_dir)
             # Without O_TRUNC, POSIX preserves any bytes the caller does not
             # overwrite, so the buffer must start as a copy of the current
             # remote file. Otherwise a partial write (e.g. rewriting only the
@@ -409,10 +409,10 @@ class UnityCatalogFS(pyfuse3.Operations):
                         )
                         if len(chunk) == 0:
                             break
-                        write_buffer.write(pos, chunk)
+                        await write_buffer.write(pos, chunk)
                         pos += len(chunk)
                 except Exception as e:
-                    write_buffer.close()
+                    await write_buffer.close()
                     self._raise_fuse_error(e, fs_path=entry.fs_path, op="open/preload")
 
         fh = self._open_fh_count
@@ -465,7 +465,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         self._open_state[fh] = {
             "inode": entry.inode,
             "ctx": ctx,
-            "write_buffer": WriteBuffer(self._writes_dir),
+            "write_buffer": await WriteBuffer.create(self._writes_dir),
             "writable": True,
             # Mark dirty immediately: create() semantics guarantee the file
             # exists after release(), even if nothing is written into it.
@@ -497,7 +497,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             # the complete file (writes smaller than ~8 KB would otherwise read
             # back as zero bytes). Keep the handle open: flush may be delivered
             # again with more writes before release.
-            write_buffer.flush_to_disk()
+            await write_buffer.flush_to_disk()
             await self.uc_client.upload_file(uc_path, write_buffer.path, ctx=state["ctx"])
         except Exception as e:
             logger.error("Upload failed for %s: %s", entry.fs_path, e)
@@ -535,7 +535,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         entry = self.inodes.get_entry(inode)
         if entry is None:
             if write_buffer is not None:
-                write_buffer.close()
+                await write_buffer.close()
             del self._open_state[fh]
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -553,7 +553,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                     raise pyfuse3.FUSEError(errno.EIO)
         finally:
             if write_buffer is not None:
-                write_buffer.close()
+                await write_buffer.close()
             if fh in self._open_state:
                 del self._open_state[fh]
 
@@ -575,7 +575,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         # the full file content downloaded at open() plus any in-progress writes.
         write_buffer: WriteBuffer | None = state.get("write_buffer")
         if state.get("writable") and write_buffer is not None:
-            return write_buffer.read(offset, length)
+            return await write_buffer.read(offset, length)
 
         try:
             if self._dispatch(entry.fs_path) == "auth":
@@ -632,7 +632,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                 # File was opened read-only.
                 raise pyfuse3.FUSEError(errno.EACCES)
 
-            n = write_buffer.write(offset, buffer)
+            n = await write_buffer.write(offset, buffer)
             state["dirty"] = True
             # Keep st_size current so getattr() reflects the in-progress size.
             entry.attr.st_size = write_buffer.size()
@@ -822,7 +822,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         # No server-side move: download source -> upload to dest -> delete source.
         src_uc = fs_to_uc_path(old_fs_path)
         dst_uc = fs_to_uc_path(new_fs_path)
-        write_buffer = WriteBuffer(self._writes_dir)
+        write_buffer = await WriteBuffer.create(self._writes_dir)
         try:
             file_size = src_entry.attr.st_size
             pos = 0
@@ -835,18 +835,18 @@ class UnityCatalogFS(pyfuse3.Operations):
                 )
                 if len(chunk) == 0:
                     break
-                write_buffer.write(pos, chunk)
+                await write_buffer.write(pos, chunk)
                 pos += len(chunk)
-            write_buffer.finalize()
+            await write_buffer.finalize()
             await self.uc_client.upload_file(dst_uc, write_buffer.path, ctx=ctx)
         except pyfuse3.FUSEError:
-            write_buffer.close()
+            await write_buffer.close()
             raise
         except Exception as exc:
-            write_buffer.close()
+            await write_buffer.close()
             self._raise_fuse_error(exc, fs_path=new_fs_path, op="rename/upload")
         else:
-            write_buffer.close()
+            await write_buffer.close()
 
         # Drop the source only after the copy is durably uploaded.
         try:
@@ -937,14 +937,14 @@ class UnityCatalogFS(pyfuse3.Operations):
         writer = self._find_open_writer(entry.inode, fh)
         if writer is not None:
             write_buffer: WriteBuffer = writer["write_buffer"]
-            write_buffer.truncate(new_size)
+            await write_buffer.truncate(new_size)
             writer["dirty"] = True
             entry.attr.st_size = write_buffer.size()
             return
 
         # Path-based truncate of a closed file: copy the bytes we keep, resize,
         # upload now.
-        write_buffer = WriteBuffer(self._writes_dir)
+        write_buffer = await WriteBuffer.create(self._writes_dir)
         try:
             old_size = entry.attr.st_size
             to_copy = min(new_size, old_size)
@@ -961,10 +961,10 @@ class UnityCatalogFS(pyfuse3.Operations):
                     # remote file isn't what we expected. Fail rather than
                     # silently zero-fill the tail.
                     raise pyfuse3.FUSEError(errno.EIO)
-                write_buffer.write(pos, chunk)
+                await write_buffer.write(pos, chunk)
                 pos += len(chunk)
-            write_buffer.truncate(new_size)  # zero-extends when growing
-            write_buffer.finalize()
+            await write_buffer.truncate(new_size)  # zero-extends when growing
+            await write_buffer.finalize()
             uc_path = fs_to_uc_path(entry.fs_path)
             await self.uc_client.upload_file(uc_path, write_buffer.path, ctx=ctx)
         except pyfuse3.FUSEError:
@@ -972,7 +972,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         except Exception as exc:
             self._raise_fuse_error(exc, fs_path=entry.fs_path, op="setattr/truncate")
         finally:
-            write_buffer.close()
+            await write_buffer.close()
         entry.attr.st_size = new_size
         self.metadata_manager.invalidate(entry.fs_path, is_dir=False)
         await self.data_manager.invalidate_path(entry.fs_path)
