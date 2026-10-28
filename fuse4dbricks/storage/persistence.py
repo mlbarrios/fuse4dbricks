@@ -13,6 +13,8 @@ from typing import AsyncGenerator, Tuple
 
 import trio
 
+from fuse4dbricks.perf import profiling
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,9 +129,11 @@ class DiskPersistence:
                         self.access_map[cache_path] = now
                         heappush(self.access_log, (now, cache_path, len(data)))
 
+            profiling.cache_event("disk", hit=True)
             return data
 
         except FileNotFoundError:
+            profiling.cache_event("disk", hit=False)
             return None
 
     def _read_file(self, path: str) -> bytes:
@@ -164,6 +168,7 @@ class DiskPersistence:
         temp_path = f"{cache_path}.{os.getpid()}.tmp"
         result = bytearray()
         bytes_written = 0
+        span = profiling.start("disk_cache_store", path=fs_path, category="cache")
         try:
             # The shard dir is created lazily here (off-thread), only when we
             # actually write a chunk — not on every read in _get_chunk_path.
@@ -189,10 +194,12 @@ class DiskPersistence:
                 now = time.time()
                 self.access_map[cache_path] = now
                 heappush(self.access_log, (now, cache_path, bytes_written))
+            span.finish(status="success", nbytes=bytes_written)
             return bytes(result)
         except Exception as e:
             if os.path.exists(temp_path):
                 await trio.to_thread.run_sync(os.remove, temp_path)
+            span.finish(status="error", nbytes=bytes_written)
             raise e
 
     async def evict(self, required_space: int):
@@ -222,6 +229,7 @@ class DiskPersistence:
                 # Remove from index immediately
                 del self.access_map[path]
                 self.current_size -= size
+                profiling.cache_eviction("disk")
 
             # 2. I/O PHASE (Lock Released)
             try:

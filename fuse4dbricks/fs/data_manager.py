@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import errno
 import logging
+import time
 from typing import Tuple
 from collections import OrderedDict
 import trio
@@ -12,6 +13,7 @@ from fuse4dbricks.fs.utils import fs_to_uc_path, InflightCoalescer
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.storage.persistence import DiskPersistence
 from fuse4dbricks.fs.ram_cache import RamCache
+from fuse4dbricks.perf import profiling
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,8 @@ class _ChunkRequest:
     "size of this chunk. It may be smaller than the typical chunk_size on the last chunk of o a file"
     ctx: pyfuse3.RequestContext
     "request context, used for auth when downloading"
+    enqueued_at: float = 0.0
+    "profiling only: monotonic time when this request was accepted into the scheduler's queue"
 
 
 # Chunk cache key: (fs_path, chunk_id, mtime, gen). mtime guards against the
@@ -78,19 +82,31 @@ class DownloadScheduler:
                 except trio.EndOfChannel:
                     return
                 continue
+            if chunk_request.enqueued_at:
+                queued_ms = (time.monotonic() - chunk_request.enqueued_at) * 1000.0
+                profiling.record_duration(
+                    "download_queue_wait", queued_ms, category="scheduler",
+                    path=chunk_request.fs_path,
+                )
             # A failed download must never escape the worker: otherwise the
             # exception would propagate to the nursery and tear down the whole
             # mount for every user. _process_request always wakes waiters (via
             # notify_done in its finally), so they observe a missing chunk and
             # the read fails with EIO in isolation. trio.Cancelled is a
             # BaseException and still propagates, so shutdown is unaffected.
+            span = profiling.start(
+                "download_worker_execution", path=chunk_request.fs_path, category="scheduler",
+            )
             try:
                 await self._process_request(chunk_request, priority)
             except Exception:
+                span.finish(status="error")
                 logger.exception(
                     "Chunk download worker failed for %s (chunk %s, mtime %s)",
                     chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime,
                 )
+            else:
+                span.finish(status="success")
 
     async def _poke_worker(self) -> None:
         # Non-blocking "poke"; if buffer is full, a worker is already awake.
@@ -106,11 +122,13 @@ class DownloadScheduler:
                 # If request for that chunk was present as a regular request, promote it:
                 if cache_key in self._requests_regular:
                     self._requests_regular.pop(cache_key)
+                chunk_request.enqueued_at = time.monotonic()
                 self._requests_priority[cache_key] = chunk_request
                 await self._poke_worker()
             else:
                 # If request for that chunk was already a priority request, ignore it, otherwise add it
                 if cache_key not in self._requests_priority:
+                    chunk_request.enqueued_at = time.monotonic()
                     self._requests_regular[cache_key] = chunk_request
                     await self._poke_worker()
 
@@ -175,6 +193,11 @@ class DataManager:
                 if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
                     await self._fetch_chunk(chunk_request)
         finally:
+            if chunk_request.enqueued_at:
+                ready_ms = (time.monotonic() - chunk_request.enqueued_at) * 1000.0
+                profiling.record_duration(
+                    "chunk_ready", ready_ms, category="scheduler", path=chunk_request.fs_path,
+                )
             await self._inflight_coalescer.notify_done(cache_key)
 
 
@@ -186,6 +209,7 @@ class DataManager:
         uc_path = fs_to_uc_path(chunk_request.fs_path)
         offset = self.chunk_size * chunk_request.chunk_id
         length = chunk_request.chunk_size
+        span = profiling.start("remote_fetch", path=chunk_request.fs_path, category="network")
         stream = self.uc_client.download_chunk_stream(
             path=uc_path,
             offset=offset,
@@ -193,13 +217,18 @@ class DataManager:
             ctx=chunk_request.ctx,
             if_unmodified_since=chunk_request.mtime,
         )
-        chunk = await self.persistence.store_chunk_from_stream(
-            fs_path=chunk_request.fs_path,
-            chunk_index=chunk_request.chunk_id,
-            mtime=chunk_request.mtime,
-            gen=chunk_request.gen,
-            stream=stream,
-        )
+        try:
+            chunk = await self.persistence.store_chunk_from_stream(
+                fs_path=chunk_request.fs_path,
+                chunk_index=chunk_request.chunk_id,
+                mtime=chunk_request.mtime,
+                gen=chunk_request.gen,
+                stream=stream,
+            )
+        except BaseException:
+            span.finish(status="error")
+            raise
+        span.finish(status="success", nbytes=len(chunk))
         return chunk
 
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, gen: int, ctx: pyfuse3.RequestContext):
@@ -215,11 +244,15 @@ class DataManager:
     async def _get_chunk_from_cache_or_disk(self, fs_path: str, chunk_id: int, mtime: float, gen: int) -> bytes | None:
         cache_key = (fs_path, chunk_id, mtime, gen)
         # get chunk from ram
+        span = profiling.start("ram_cache_lookup", path=fs_path, category="cache_ram")
         cached = await self._ram_cache.get(cache_key)
+        span.finish(status="success", nbytes=len(cached) if cached is not None else 0)
         if cached is not None:
             return cached
         # get chunk from disk
+        span = profiling.start("disk_cache_lookup", path=fs_path, category="cache_disk")
         chunk = await self.persistence.retrieve_chunk(fs_path, chunk_id, mtime, gen)
+        span.finish(status="success", nbytes=len(chunk) if chunk is not None else 0)
         if chunk is not None:
             await self._ram_cache.put(cache_key, chunk)
         return chunk
@@ -244,7 +277,9 @@ class DataManager:
             await self._download_scheduler.enqueue_request(chunk_request, high_priority=True)
 
         # Now we wait for the download to complete and fetch it from RAM or Disk
+        span = profiling.start("chunk_wait", path=fs_path, category="data_manager")
         await wait_event.wait()
+        span.finish(status="success")
         chunk = await self._get_chunk_from_cache_or_disk(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, gen=gen)
         # here if chunk is none, we will return None and let the caller decide what to do (probably return EIO)
         out_dict[chunk_id] = chunk
@@ -258,69 +293,76 @@ class DataManager:
         Reads file contents
         Raises on error raise pyfuse3.FUSEError(errno.EIO)
         """
+        span = profiling.start("data_manager_read", path=fs_path, category="data_manager")
         # Resolve the cache generation once for the whole read so every chunk
         # (and the prefetch below) shares a consistent key.
         gen = self._generation(fs_path)
         # Determine path and chunks that need to be read
         if offset >= file_size:
+            span.finish(status="success", nbytes=0)
             return bytes()
-        last_chunk_size = file_size % self.chunk_size
-        num_chunks_in_file = file_size // self.chunk_size
-        if last_chunk_size > 0:
-            num_chunks_in_file += 1
-        else:
-            last_chunk_size = self.chunk_size
-        start_chunk = offset // self.chunk_size
-        end_chunk = (offset + length - 1) // self.chunk_size
-        if end_chunk >= num_chunks_in_file:
-            end_chunk = num_chunks_in_file - 1
-        chunks_to_read = list(range(start_chunk, end_chunk + 1))
-        # Download all required chunks
-        chunks: dict[int, bytes|None] = {}
-        if len(chunks_to_read) == 1:
-            chunk_id = chunks_to_read[0]
-            if chunk_id == num_chunks_in_file - 1:
-                chunk_size = last_chunk_size
+        try:
+            last_chunk_size = file_size % self.chunk_size
+            num_chunks_in_file = file_size // self.chunk_size
+            if last_chunk_size > 0:
+                num_chunks_in_file += 1
             else:
-                chunk_size = self.chunk_size
-            await self._read_chunk(fs_path, chunk_id, mtime, gen, chunk_size, ctx, chunks)
-        else:
-            # dictionary: chunk_id -> bytes
-            async with trio.open_nursery() as nursery:
-                for chunk_id in chunks_to_read:
-                    if chunk_id == num_chunks_in_file - 1:
-                        chunk_size = last_chunk_size
-                    else:
-                        chunk_size = self.chunk_size
-                    nursery.start_soon(
-                        self._read_chunk, fs_path, chunk_id, mtime, gen, chunk_size, ctx, chunks
-                    )
-        # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
-        num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
-        chunks_to_prefetch = []
-        for i in range(num_chunks_to_prefetch):
-            chunk_to_prefetch = end_chunk + 1 + i
-            if chunk_to_prefetch >= num_chunks_in_file:
-                # chunk_to_prefetch beyond EOF, stop
-                break
-            # chunk_size: Last chunk in file may be shorter
-            if chunk_to_prefetch == num_chunks_in_file -1:
-                chunk_size = last_chunk_size
+                last_chunk_size = self.chunk_size
+            start_chunk = offset // self.chunk_size
+            end_chunk = (offset + length - 1) // self.chunk_size
+            if end_chunk >= num_chunks_in_file:
+                end_chunk = num_chunks_in_file - 1
+            chunks_to_read = list(range(start_chunk, end_chunk + 1))
+            # Download all required chunks
+            chunks: dict[int, bytes|None] = {}
+            if len(chunks_to_read) == 1:
+                chunk_id = chunks_to_read[0]
+                if chunk_id == num_chunks_in_file - 1:
+                    chunk_size = last_chunk_size
+                else:
+                    chunk_size = self.chunk_size
+                await self._read_chunk(fs_path, chunk_id, mtime, gen, chunk_size, ctx, chunks)
             else:
-                chunk_size = self.chunk_size
-            # Add to list to fetch:
-            chunks_to_prefetch.append((chunk_to_prefetch, chunk_size))
-        await self._request_fetch_ahead_chunks(fs_path, chunks_to_prefetch, mtime, gen, ctx)
-        # Assemble chunks
-        result = bytearray()
-        for chunk_id in chunks_to_read:
-            chunk_data = chunks.get(chunk_id)
-            if chunk_data is None:
-                raise pyfuse3.FUSEError(errno.EIO)
-            # Calculate the start and end within the chunk
-            chunk_start = max(0, offset - chunk_id * self.chunk_size)
-            chunk_end = min(
-                len(chunk_data), offset + length - chunk_id * self.chunk_size
-            )
-            result.extend(chunk_data[chunk_start:chunk_end])
+                # dictionary: chunk_id -> bytes
+                async with trio.open_nursery() as nursery:
+                    for chunk_id in chunks_to_read:
+                        if chunk_id == num_chunks_in_file - 1:
+                            chunk_size = last_chunk_size
+                        else:
+                            chunk_size = self.chunk_size
+                        nursery.start_soon(
+                            self._read_chunk, fs_path, chunk_id, mtime, gen, chunk_size, ctx, chunks
+                        )
+            # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
+            num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
+            chunks_to_prefetch = []
+            for i in range(num_chunks_to_prefetch):
+                chunk_to_prefetch = end_chunk + 1 + i
+                if chunk_to_prefetch >= num_chunks_in_file:
+                    # chunk_to_prefetch beyond EOF, stop
+                    break
+                # chunk_size: Last chunk in file may be shorter
+                if chunk_to_prefetch == num_chunks_in_file -1:
+                    chunk_size = last_chunk_size
+                else:
+                    chunk_size = self.chunk_size
+                # Add to list to fetch:
+                chunks_to_prefetch.append((chunk_to_prefetch, chunk_size))
+            await self._request_fetch_ahead_chunks(fs_path, chunks_to_prefetch, mtime, gen, ctx)
+            # Assemble chunks
+            result = bytearray()
+            for chunk_id in chunks_to_read:
+                chunk_data = chunks.get(chunk_id)
+                if chunk_data is None:
+                    raise pyfuse3.FUSEError(errno.EIO)
+                # Calculate the start and end within the chunk
+                chunk_start = max(0, offset - chunk_id * self.chunk_size)
+                chunk_end = min(
+                    len(chunk_data), offset + length - chunk_id * self.chunk_size
+                )
+                result.extend(chunk_data[chunk_start:chunk_end])
+        except BaseException:
+            span.finish(status="error")
+            raise
+        span.finish(status="success", nbytes=len(result))
         return bytes(result)

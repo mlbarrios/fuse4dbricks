@@ -2,6 +2,8 @@ import trio
 from collections import OrderedDict
 from typing import TypeVar, Generic
 
+from fuse4dbricks.perf import profiling
+
 CacheKey = TypeVar("CacheKey")
 
 class RamCache(Generic[CacheKey]):
@@ -23,13 +25,16 @@ class RamCache(Generic[CacheKey]):
 
     async def get(self, key: CacheKey) -> bytes | None:
         if self._max_entries == 0:
+            profiling.cache_event("ram", hit=False)
             return None
         async with self._lock:
             value = self._lru.get(key)
             if value is None:
+                profiling.cache_event("ram", hit=False)
                 return None
             # mark as recently used
             self._lru.move_to_end(key, last=True)
+            profiling.cache_event("ram", hit=True)
             return value
 
     async def put(self, key: CacheKey, value: bytes) -> None:

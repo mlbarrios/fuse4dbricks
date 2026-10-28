@@ -28,6 +28,7 @@ from fuse4dbricks.api.errors import (
     UcUnavailable,
 )
 from fuse4dbricks.auth.provider import AuthProvider
+from fuse4dbricks.perf import profiling
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ class UnityCatalogClient:
                     "Transient error %s (attempt %d/%d), retrying in %.1fs",
                     exc, attempt + 1, max_retries, delay,
                 )
+                profiling.record_retry("with_retry", reason=type(exc).__name__, delay_s=delay, path=uc_path)
                 await trio.sleep(delay)
                 attempt += 1
             except Exception as exc:
@@ -175,6 +177,7 @@ class UnityCatalogClient:
                         "SDK transient error %s (attempt %d/%d), retrying in %.1fs",
                         exc, attempt + 1, max_retries, delay,
                     )
+                    profiling.record_retry("with_retry", reason=type(exc).__name__, delay_s=delay, path=uc_path)
                     await trio.sleep(delay)
                     attempt += 1
                 else:
@@ -248,6 +251,11 @@ class UnityCatalogClient:
         base_headers = await self._get_headers(ctx=ctx)
         headers.update(base_headers)
 
+        # Request-level profiling: isolates backend/transport latency (this
+        # span) from the higher-level download-stream/upload spans that wrap
+        # a call to this method, so "where did the time go" can separate
+        # backend round-trip time from stream-iteration or local-buffering time.
+        span = profiling.start("http_request", path=uc_path or url, category="http")
         attempt = 0
         while True:
             request = self.client.build_request(method, url, params=params, headers=headers)
@@ -262,10 +270,15 @@ class UnityCatalogClient:
                         f"Transport error to {url}: {e}. "
                         f"Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})."
                     )
+                    profiling.record_retry(
+                        "http_request", reason="TransportError", delay_s=delay,
+                        path=uc_path or url,
+                    )
                     await trio.sleep(delay)
                     attempt += 1
                     continue
                 logger.error(f"Connection error to {url}: {e}")
+                span.finish(status="error", method=method, endpoint=url, retry_attempts=attempt)
                 raise
 
             # 401 Retry Logic (Token Expiration)
@@ -299,6 +312,10 @@ class UnityCatalogClient:
                     f"Transient error {response.status_code} for {url}. "
                     f"Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})."
                 )
+                profiling.record_retry(
+                    "http_request", reason=f"http_{response.status_code}", delay_s=delay,
+                    path=uc_path or url,
+                )
                 await trio.sleep(delay)
                 attempt += 1
                 continue
@@ -306,27 +323,65 @@ class UnityCatalogClient:
             if not stream:
                 if response.status_code == 404:
                     if raise_on_not_found:
+                        span.finish(
+                            status="error", method=method, endpoint=url,
+                            status_code=404, retry_attempts=attempt,
+                        )
                         raise UcNotFound(
                             f"Not found: {uc_path or url}",
                             status_code=404,
                             uc_path=uc_path,
                         )
+                    span.finish(
+                        status="success", method=method, endpoint=url,
+                        status_code=404, retry_attempts=attempt,
+                    )
                     return None
-                self._raise_for_status(response, uc_path=uc_path)
+                try:
+                    self._raise_for_status(response, uc_path=uc_path)
+                except Exception:
+                    span.finish(
+                        status="error", method=method, endpoint=url,
+                        status_code=response.status_code, retry_attempts=attempt,
+                    )
+                    raise
 
                 if method == "HEAD":
+                    span.finish(
+                        status="success", method=method, endpoint=url,
+                        status_code=response.status_code, retry_attempts=attempt,
+                    )
                     return response
                 if response.content:
+                    span.finish(
+                        status="success", nbytes=len(response.content), method=method,
+                        endpoint=url, status_code=response.status_code, retry_attempts=attempt,
+                    )
                     try:
                         return response.json()
                     except Exception:
                         return None
+                span.finish(
+                    status="success", method=method, endpoint=url,
+                    status_code=response.status_code, retry_attempts=attempt,
+                )
                 return None
 
             # For streams, we return the response object to be used in a context manager
             if response.status_code >= 400:
                 await response.aclose()
-                self._raise_for_status(response, uc_path=uc_path)
+                try:
+                    self._raise_for_status(response, uc_path=uc_path)
+                except Exception:
+                    span.finish(
+                        status="error", method=method, endpoint=url,
+                        status_code=response.status_code, retry_attempts=attempt,
+                    )
+                    raise
+            span.finish(
+                status="success", method=method, endpoint=url,
+                status_code=response.status_code, retry_attempts=attempt,
+            )
             return response
 
     # --- Discovery Layer (Pagination Support) ---
@@ -685,7 +740,17 @@ class UnityCatalogClient:
                 fresh = await self.auth_provider.get_access_token(ctx=ctx)
                 await _upload_with_token(fresh)
 
-        await self._with_retry(_attempt, uc_path=uc_path)
+        span = profiling.start("upload_file", path=uc_path, category="backend")
+        try:
+            size = os.path.getsize(local_path)
+        except OSError:
+            size = 0
+        try:
+            await self._with_retry(_attempt, uc_path=uc_path)
+        except Exception:
+            span.finish(status="error", nbytes=size)
+            raise
+        span.finish(status="success", nbytes=size)
 
     async def delete_file(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
         encoded_path = self._quote_path(uc_path)
@@ -733,10 +798,18 @@ class UnityCatalogClient:
         # We use _request with stream=True
         response = await self._request("GET", endpoint, ctx=ctx, headers=headers, stream=True, uc_path=path)
 
+        span = profiling.start("download_chunk_stream", path=path, category="backend")
+        total = 0
         try:
             # Yield data in increments of 64KB
             async for chunk in response.aiter_bytes(chunk_size=65536):
+                total += len(chunk)
                 yield chunk
+        except BaseException:
+            span.finish(status="error", nbytes=total)
+            raise
+        else:
+            span.finish(status="success", nbytes=total)
         finally:
             # Crucial: close the stream to release the connection back to the pool
             await response.aclose()

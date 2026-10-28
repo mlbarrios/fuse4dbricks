@@ -870,7 +870,7 @@ async def test_wronly_partial_write_preserves_tail(fs, inode_manager, data_manag
     await fs.write(fh, offset=0, buffer=b"AAA")
     wb = fs._open_state[fh]["write_buffer"]
     assert wb.size() == 10
-    assert wb.read(0, 10) == b"AAA3456789"
+    assert await wb.read(0, 10) == b"AAA3456789"
     await fs.release(pyfuse3.FileHandleT(fh))
     uc_client.upload_file.assert_awaited_once()
 
