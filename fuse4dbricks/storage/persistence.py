@@ -8,12 +8,36 @@ import logging
 import os
 import shutil
 import time
+from functools import lru_cache
 from heapq import heappop, heappush
 from typing import AsyncGenerator, Tuple
 
 import trio
 
 logger = logging.getLogger(__name__)
+
+# A/B experiment:
+#   stream -> comportamiento actual (un write por bloque recibido)
+#   single -> acumular el chunk completo y hacer un único write
+
+DISK_WRITE_MODE = (
+    "single"
+    if os.environ.get("FUSE4DBRICKS_DISK_WRITE_MODE", "").strip().lower() == "single"
+    else "stream"
+)
+
+# access_map value marking an indexed chunk whose file turned out to be missing
+# (deleted behind our back). Real access times are always > 0. The entry is
+# kept, not deleted, so that its size is still released from current_size when
+# evict() later pops the matching access_log record and finds the file gone.
+_MISSING = 0.0
+
+
+@lru_cache(maxsize=4096)
+def _path_hash(fs_path: str) -> str:
+    """sha256 of an fs_path. Cached: has_chunk() runs for every prefetch
+    candidate of every read, and hashing dominated its cost."""
+    return hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
 
 
 def clear_cache(cache_dir: str):
@@ -36,7 +60,9 @@ class DiskPersistence:
         self.current_size = 0
         self.lock = trio.Lock()
         self.access_log: list[Tuple[float, str, int]] = []  # Heap: (now, cache_path, bytes_written)
-        self.access_map: dict[str, float] = {}  # {cache_path: latest_use_timestamp}
+        # {cache_path: latest_use_timestamp}. Also the in-RAM index of which
+        # chunks are on disk (see has_chunk); _MISSING marks a stale entry.
+        self.access_map: dict[str, float] = {}
 
     def run_services(self, nursery):
         """Starts background maintenance and discovery."""
@@ -54,7 +80,7 @@ class DiskPersistence:
         ``_ensure_parent_dir``); a read of a missing chunk simply hits
         FileNotFoundError and returns None.
         """
-        sha256_hash = hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
+        sha256_hash = _path_hash(fs_path)
         shard1 = sha256_hash[:2]
         shard2 = f"{(chunk_index // 1000):07d}"  # Secondary shard to prevent too many files in one dir
         shard_dir = os.path.join(self.cache_dir, shard1, shard2)
@@ -64,6 +90,31 @@ class DiskPersistence:
         return os.path.join(
             shard_dir, f"{sha256_hash}_{mtime_ms}_g{gen}_{chunk_index:07d}.bin"
         )
+
+    def has_chunk(self, fs_path: str, chunk_index: int, mtime: float, gen: int = 0) -> bool:
+        """Whether the chunk is on disk, according to the in-RAM index.
+
+        Synchronous and lock-free (a single dict lookup, no await, no thread
+        hop), so the read path can call it for every prefetch candidate. It
+        does not refresh the LRU timestamp.
+
+        The index can briefly disagree with the disk:
+          * false negatives while the startup scan (``_graceful_init``) is
+            still running, or while ``evict`` removes a file: callers fall back
+            to downloading / ``chunk_exists``, which is harmless;
+          * false positives if a file is deleted behind our back: the next
+            ``retrieve_chunk``/``chunk_exists`` on it notices and marks the
+            entry ``_MISSING``, after which this returns False.
+        """
+        ts = self.access_map.get(self._get_chunk_path(fs_path, chunk_index, mtime, gen))
+        return ts is not None and ts != _MISSING
+
+    async def _mark_missing(self, cache_path: str) -> None:
+        """The index has ``cache_path`` but the file is gone: stop reporting it
+        as present. Size accounting is settled later by evict()."""
+        async with self.lock:
+            if cache_path in self.access_map:
+                self.access_map[cache_path] = _MISSING
 
     @staticmethod
     def _ensure_parent_dir(path: str) -> None:
@@ -130,6 +181,7 @@ class DiskPersistence:
             return data
 
         except FileNotFoundError:
+            await self._mark_missing(cache_path)
             return None
 
     def _read_file(self, path: str) -> bytes:
@@ -149,7 +201,10 @@ class DiskPersistence:
         async with self.lock:
             if cache_path in self.access_map:
                 self.access_map[cache_path] = time.time()
-        return await trio.to_thread.run_sync(os.path.exists, cache_path)
+        exists = await trio.to_thread.run_sync(os.path.exists, cache_path)
+        if not exists:
+            await self._mark_missing(cache_path)
+        return exists
 
     async def store_chunk_from_stream(
         self,
@@ -171,10 +226,17 @@ class DiskPersistence:
 
             # Write to .tmp (No lock needed)
             async with await trio.open_file(temp_path, "wb") as f:
+                single_write = DISK_WRITE_MODE == "single"
+
                 async for chunk in stream:
-                    await f.write(chunk)
                     bytes_written += len(chunk)
                     result.extend(chunk)
+
+                    if not single_write:
+                        await f.write(chunk)
+
+                if single_write and result:
+                    await f.write(result)            
 
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)

@@ -529,3 +529,121 @@ async def test_background_maintenance_non_blocking(persistence):
 
     assert persistence.current_size == 0
     assert path not in persistence.access_map
+
+
+# --- DISK WRITE MODE A/B (stream vs single) ---
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize("mode", ["stream", "single"])
+async def test_disk_write_modes_have_identical_cache_semantics(persistence, monkeypatch, mode):
+    """A (128 x 64 KB style per-piece writes) and B (one write per chunk) must
+    produce the same file, return value, .tmp + rename outcome and bookkeeping."""
+    import fuse4dbricks.storage.persistence as persistence_mod
+
+    monkeypatch.setattr(persistence_mod, "DISK_WRITE_MODE", mode)
+    data = os.urandom(4096)
+    returned = await persistence.store_chunk_from_stream(
+        "ab", 3, 1.0, async_byte_generator(data, chunk_size=512)
+    )
+    assert returned == data
+
+    path = persistence._get_chunk_path("ab", 3, 1.0)
+    with open(path, "rb") as fh:
+        assert fh.read() == data
+    assert not [f for f in os.listdir(os.path.dirname(path)) if f.endswith(".tmp")]
+    assert persistence.current_size == len(data)
+    assert path in persistence.access_map
+    assert await persistence.retrieve_chunk("ab", 3, 1.0) == data
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize("mode", ["stream", "single"])
+async def test_disk_write_modes_empty_stream(persistence, monkeypatch, mode):
+    import fuse4dbricks.storage.persistence as persistence_mod
+
+    monkeypatch.setattr(persistence_mod, "DISK_WRITE_MODE", mode)
+    assert await persistence.store_chunk_from_stream("e", 0, 1.0, async_byte_generator(b"")) == b""
+    assert os.path.getsize(persistence._get_chunk_path("e", 0, 1.0)) == 0
+
+
+def test_disk_write_mode_defaults_to_stream():
+    import fuse4dbricks.storage.persistence as persistence_mod
+
+    assert persistence_mod.DISK_WRITE_MODE == "stream"
+# --- IN-RAM CHUNK INDEX (has_chunk) ---
+
+
+@pytest.mark.trio
+async def test_has_chunk_tracks_store_and_key_fields(persistence):
+    assert not persistence.has_chunk("f", 0, 1.0)
+    await persistence.store_chunk_from_stream("f", 0, 1.0, async_byte_generator(b"abc"))
+    assert persistence.has_chunk("f", 0, 1.0)
+    assert persistence.has_chunk("f", 0, 1.0, gen=0)
+    # Every component of the key matters.
+    assert not persistence.has_chunk("f", 1, 1.0)
+    assert not persistence.has_chunk("f", 0, 2.0)
+    assert not persistence.has_chunk("f", 0, 1.0, gen=1)
+    assert not persistence.has_chunk("g", 0, 1.0)
+
+
+@pytest.mark.trio
+async def test_has_chunk_is_synchronous_and_does_not_touch_lru(persistence):
+    await persistence.store_chunk_from_stream("f", 0, 1.0, async_byte_generator(b"abc"))
+    path = persistence._get_chunk_path("f", 0, 1.0)
+    before = persistence.access_map[path]
+    with patch("trio.to_thread.run_sync", side_effect=AssertionError("no thread hop")):
+        assert persistence.has_chunk("f", 0, 1.0) is True
+    assert persistence.access_map[path] == before
+
+
+@pytest.mark.trio
+async def test_has_chunk_false_after_eviction(cache_dir):
+    p = DiskPersistence(cache_dir, max_size_gb=100 / 1024**3)  # 100 bytes
+    await p.store_chunk_from_stream("f", 0, 0.0, async_byte_generator(b"A" * 60))
+    await trio.sleep(0.01)
+    await p.store_chunk_from_stream("f", 1, 0.0, async_byte_generator(b"B" * 60))
+    assert not p.has_chunk("f", 0, 0.0)
+    assert p.has_chunk("f", 1, 0.0)
+
+
+@pytest.mark.trio
+async def test_has_chunk_sees_files_found_by_startup_scan(cache_dir):
+    p1 = DiskPersistence(cache_dir)
+    await p1.store_chunk_from_stream("f", 3, 0.0, async_byte_generator(b"xyz"))
+    p2 = DiskPersistence(cache_dir)  # fresh process: empty index until scanned
+    assert not p2.has_chunk("f", 3, 0.0)
+    p2._sync_scan()
+    assert p2.has_chunk("f", 3, 0.0)
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize("probe", ["retrieve_chunk", "chunk_exists"])
+async def test_externally_deleted_chunk_is_marked_missing(persistence, probe):
+    data = b"data"
+    await persistence.store_chunk_from_stream("f", 0, 0.0, async_byte_generator(data))
+    path = persistence._get_chunk_path("f", 0, 0.0)
+    os.remove(path)  # deleted behind our back
+    assert persistence.has_chunk("f", 0, 0.0)  # index is stale until someone looks
+
+    if probe == "retrieve_chunk":
+        assert await persistence.retrieve_chunk("f", 0, 0.0) is None
+    else:
+        assert await persistence.chunk_exists("f", 0, 0.0) is False
+
+    assert not persistence.has_chunk("f", 0, 0.0)
+    # Size is still accounted until evict() settles it.
+    assert persistence.current_size == len(data)
+    await persistence.evict(persistence.max_size_bytes)  # force a full sweep
+    assert persistence.current_size == 0
+    assert path not in persistence.access_map
+
+
+@pytest.mark.trio
+async def test_missing_chunk_can_be_stored_again(persistence):
+    await persistence.store_chunk_from_stream("f", 0, 0.0, async_byte_generator(b"old"))
+    os.remove(persistence._get_chunk_path("f", 0, 0.0))
+    assert await persistence.retrieve_chunk("f", 0, 0.0) is None
+    await persistence.store_chunk_from_stream("f", 0, 0.0, async_byte_generator(b"new"))
+    assert persistence.has_chunk("f", 0, 0.0)
+    assert await persistence.retrieve_chunk("f", 0, 0.0) == b"new"
