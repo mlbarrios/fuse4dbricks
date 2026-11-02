@@ -25,6 +25,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 _LOGGER_NAME = "fuse4dbricks.perf"
@@ -239,6 +240,125 @@ def record_duration(
     }
     if extra:
         event.update(extra)
+    _emit(event)
+
+
+# ---------------------------------------------------------------------------
+# Phase breakdown: decomposes one outer operation (e.g. ``remote_fetch``) into
+# phases timed in different layers (DataManager -> UnityCatalogClient ->
+# DiskPersistence) without threading timing objects through their signatures.
+# All of those layers run in the same trio task (the download async generator
+# executes in its consumer's task), so a ContextVar carries the active
+# breakdown; concurrent fetches in other tasks never see each other's.
+# ---------------------------------------------------------------------------
+
+
+def _clock_ms() -> float:
+    return time.monotonic() * 1000.0
+
+
+def _zero_ms() -> float:
+    return 0.0
+
+
+# Bound once at import time: when disabled, hot loops pay one trivial call and
+# no clock read. Call sites must use ``profiling.now_ms()`` (attribute lookup)
+# so tests can monkeypatch it.
+now_ms = _clock_ms if ENABLED else _zero_ms
+
+
+class Breakdown:
+    """Collects phase durations for one outer operation. ``phases`` must be
+    mutually non-overlapping so ``total - sum(phases)`` is a meaningful
+    residual; ``detail`` holds overlapping/informational timings that are
+    reported but never summed."""
+
+    __slots__ = ("_start_ms", "_token", "category", "detail", "extra", "operation", "path", "phases")
+
+    def __init__(self, operation: str, path: str | None, category: str, extra: dict):
+        self.operation = operation
+        self.path = path
+        self.category = category
+        self.extra = extra
+        self.phases: dict[str, float] = {}
+        self.detail: dict[str, float] = {}
+        self._start_ms = _clock_ms()
+        self._token = None
+
+
+_current_breakdown: ContextVar[Breakdown | None] = ContextVar(
+    "fuse4dbricks_perf_breakdown", default=None
+)
+
+
+def breakdown_start(
+    operation: str, path: str | None = None, category: str = "fuse", **extra
+) -> Breakdown | None:
+    """Open a breakdown for the current task. Always pair with
+    :func:`breakdown_finish` (success and error paths). Returns None (and does
+    nothing) when profiling is disabled."""
+    if not ENABLED:
+        return None
+    bd = Breakdown(operation, path, category, extra)
+    bd._token = _current_breakdown.set(bd)
+    return bd
+
+
+def record_phase(
+    operation: str, duration_ms: float, *, path: str | None = None,
+    category: str = "fuse", nbytes: int = 0, status: str = "success",
+    exclusive: bool = True, **extra,
+) -> None:
+    """Record one phase duration into the aggregate registry and, if a
+    breakdown is active in this task, into that breakdown (``exclusive=True``
+    -> summed phase; ``exclusive=False`` -> overlapping detail). The per-phase
+    JSON line is only emitted when no breakdown is active; otherwise the
+    single ``breakdown.v1`` event carries it, keeping log volume to one line
+    per fetch. No-op when profiling is disabled."""
+    if not ENABLED:
+        return
+    bd = _current_breakdown.get()
+    if bd is None:
+        record_duration(
+            operation, duration_ms, path=path, category=category,
+            nbytes=nbytes, status=status, **extra,
+        )
+        return
+    registry.record(operation, duration_ms, nbytes, status)
+    target = bd.phases if exclusive else bd.detail
+    target[operation] = target.get(operation, 0.0) + duration_ms
+    if extra:
+        bd.extra.update(extra)
+
+
+def breakdown_finish(bd: Breakdown | None, *, status: str = "success", nbytes: int = 0) -> None:
+    """Close ``bd``, record ``<operation>_residual`` (total minus the sum of
+    exclusive phases) and emit one ``breakdown.v1`` event."""
+    if bd is None:
+        return
+    total_ms = _clock_ms() - bd._start_ms
+    if bd._token is not None:
+        _current_breakdown.reset(bd._token)
+        bd._token = None
+    accounted_ms = sum(bd.phases.values())
+    residual_ms = total_ms - accounted_ms
+    registry.record(f"{bd.operation}_residual", residual_ms, 0, status)
+    event = {
+        "schema": "breakdown.v1",
+        "ts": time.time(),
+        "category": bd.category,
+        "operation": bd.operation,
+        "path": bd.path,
+        "bytes": nbytes,
+        "status": status,
+        "total_ms": round(total_ms, 3),
+        "accounted_ms": round(accounted_ms, 3),
+        "residual_ms": round(residual_ms, 3),
+        "phases": {k: round(v, 3) for k, v in bd.phases.items()},
+        "detail": {k: round(v, 3) for k, v in bd.detail.items()},
+    }
+    if bd.extra:
+        event.update(bd.extra)
     _emit(event)
 
 

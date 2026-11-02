@@ -795,21 +795,76 @@ class UnityCatalogClient:
                 if_unmodified_since, usegmt=True
             )
 
-        # We use _request with stream=True
-        response = await self._request("GET", endpoint, ctx=ctx, headers=headers, stream=True, uc_path=path)
+        # Phase A: auth headers + connection acquire + send + retries, up to
+        # response *headers* received (httpx stream=True returns there).
+        t_req = profiling.now_ms()
+        try:
+            # We use _request with stream=True
+            response = await self._request("GET", endpoint, ctx=ctx, headers=headers, stream=True, uc_path=path)
+        except BaseException:
+            profiling.record_phase(
+                "download_request_latency", profiling.now_ms() - t_req,
+                path=path, category="backend", status="error",
+            )
+            raise
+        t_resp = profiling.now_ms()
+        profiling.record_phase(
+            "download_request_latency", t_resp - t_req, path=path,
+            category="backend", http_status=response.status_code,
+        )
 
+        # Kept for continuity. NOTE: because this is an async generator, this
+        # span stays open while suspended at ``yield``, so it includes the
+        # consumer's (disk write) time -- see download_consumer_time.
         span = profiling.start("download_chunk_stream", path=path, category="backend")
         total = 0
+        n_chunks = 0
+        t_first = t_last = t_resume = t_resp
+        net_wait_ms = 0.0   # time blocked in aiter_bytes after the first chunk
+        consumer_ms = 0.0   # time suspended at yield (consumer work)
+        status = "error"
         try:
             # Yield data in increments of 64KB
             async for chunk in response.aiter_bytes(chunk_size=65536):
+                t_arrive = profiling.now_ms()
+                if n_chunks == 0:
+                    t_first = t_arrive
+                else:
+                    net_wait_ms += t_arrive - t_resume
+                t_last = t_arrive
+                n_chunks += 1
                 total += len(chunk)
                 yield chunk
-        except BaseException:
-            span.finish(status="error", nbytes=total)
-            raise
-        else:
-            span.finish(status="success", nbytes=total)
+                t_resume = profiling.now_ms()
+                consumer_ms += t_resume - t_arrive
+            # Final read that observed EOF.
+            net_wait_ms += profiling.now_ms() - t_resume
+            status = "success"
         finally:
+            span.finish(status=status, nbytes=total)
+            # Phase B: response headers -> first body chunk.
+            profiling.record_phase(
+                "download_ttfb", (t_first - t_resp) if n_chunks else 0.0,
+                path=path, category="backend", status=status,
+            )
+            # Phase C (exclusive): pure network wait after the first chunk.
+            profiling.record_phase(
+                "download_stream_net_wait", net_wait_ms, path=path,
+                category="network", nbytes=total, status=status, net_chunks=n_chunks,
+            )
+            # Phase C (wall clock, overlaps consumer time): first -> last chunk.
+            profiling.record_phase(
+                "download_stream_transfer", t_last - t_first, path=path,
+                category="network", nbytes=total, status=status, exclusive=False,
+            )
+            profiling.record_phase(
+                "download_consumer_time", consumer_ms, path=path,
+                category="backend", status=status, exclusive=False,
+            )
+            t_close = profiling.now_ms()
             # Crucial: close the stream to release the connection back to the pool
             await response.aclose()
+            profiling.record_phase(
+                "download_response_close", profiling.now_ms() - t_close,
+                path=path, category="backend", status=status,
+            )

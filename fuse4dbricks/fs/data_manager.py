@@ -210,6 +210,12 @@ class DataManager:
         offset = self.chunk_size * chunk_request.chunk_id
         length = chunk_request.chunk_size
         span = profiling.start("remote_fetch", path=chunk_request.fs_path, category="network")
+        # Collects the per-layer phases (uc_client + persistence run in this
+        # same task) and emits one breakdown.v1 event with the residual.
+        breakdown = profiling.breakdown_start(
+            "remote_fetch", path=chunk_request.fs_path, category="network",
+            chunk_id=chunk_request.chunk_id,
+        )
         stream = self.uc_client.download_chunk_stream(
             path=uc_path,
             offset=offset,
@@ -227,8 +233,10 @@ class DataManager:
             )
         except BaseException:
             span.finish(status="error")
+            profiling.breakdown_finish(breakdown, status="error")
             raise
         span.finish(status="success", nbytes=len(chunk))
+        profiling.breakdown_finish(breakdown, status="success", nbytes=len(chunk))
         return chunk
 
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, gen: int, ctx: pyfuse3.RequestContext):

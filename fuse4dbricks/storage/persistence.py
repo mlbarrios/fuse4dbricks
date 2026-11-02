@@ -170,32 +170,67 @@ class DiskPersistence:
         bytes_written = 0
         span = profiling.start("disk_cache_store", path=fs_path, category="cache")
         try:
+            t_prep = profiling.now_ms()
             # The shard dir is created lazily here (off-thread), only when we
             # actually write a chunk — not on every read in _get_chunk_path.
             await trio.to_thread.run_sync(self._ensure_parent_dir, cache_path)
 
             # Write to .tmp (No lock needed)
             async with await trio.open_file(temp_path, "wb") as f:
+                profiling.record_phase(
+                    "disk_prepare", profiling.now_ms() - t_prep, path=fs_path, category="cache",
+                )
+                # Note: the download (request, TTFB, network) runs lazily
+                # inside this ``async for``; it is timed by the generator.
+                write_ms = 0.0
+                n_writes = 0
                 async for chunk in stream:
+                    t_w = profiling.now_ms()
                     await f.write(chunk)
+                    write_ms += profiling.now_ms() - t_w
+                    n_writes += 1
                     bytes_written += len(chunk)
                     result.extend(chunk)
+                profiling.record_phase(
+                    "disk_write_time", write_ms, path=fs_path, category="cache",
+                    nbytes=bytes_written, disk_writes=n_writes,
+                )
+                t_close = profiling.now_ms()
+            profiling.record_phase(
+                "disk_close", profiling.now_ms() - t_close, path=fs_path, category="cache",
+            )
 
+            t_fin = profiling.now_ms()
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
+            t_renamed = profiling.now_ms()
 
             # 1. EVICT (Manages Lock Internally)
             await self.evict(bytes_written)
+            t_evicted = profiling.now_ms()
 
             # 2. UPDATE METADATA (Acquire Lock)
             async with self.lock:
+                t_locked = profiling.now_ms()
                 # If overwriting, logic could go here to subtract old size
                 self.current_size += bytes_written
                 now = time.time()
                 self.access_map[cache_path] = now
                 heappush(self.access_log, (now, cache_path, bytes_written))
+            t_done = profiling.now_ms()
+            profiling.record_phase("cache_rename", t_renamed - t_fin, path=fs_path, category="cache", exclusive=False)
+            profiling.record_phase("cache_evict", t_evicted - t_renamed, path=fs_path, category="cache", exclusive=False)
+            profiling.record_phase("cache_lock_wait", t_locked - t_evicted, path=fs_path, category="cache", exclusive=False)
+            profiling.record_phase("cache_metadata_update", t_done - t_locked, path=fs_path, category="cache", exclusive=False)
+            profiling.record_phase("cache_finalize", t_done - t_fin, path=fs_path, category="cache")
             span.finish(status="success", nbytes=bytes_written)
-            return bytes(result)
+            t_mat = profiling.now_ms()
+            data = bytes(result)
+            profiling.record_phase(
+                "chunk_materialize", profiling.now_ms() - t_mat, path=fs_path,
+                category="cache", nbytes=bytes_written,
+            )
+            return data
         except Exception as e:
             if os.path.exists(temp_path):
                 await trio.to_thread.run_sync(os.remove, temp_path)
