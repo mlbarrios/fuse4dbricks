@@ -212,6 +212,32 @@ async def test_phases_do_not_double_count_disk_and_network(enabled, tmp_path, ca
 
 
 @pytest.mark.trio
+@pytest.mark.parametrize("mode,expected_writes", [("stream", N_PIECES), ("single", 1)])
+async def test_disk_write_mode_ab_metrics(enabled, tmp_path, caplog, monkeypatch, mode, expected_writes):
+    """Both arms emit the same metric set; only the hop count differs, and the
+    write-hop decomposition still reconstructs disk_write_time exactly."""
+    import fuse4dbricks.storage.persistence as persistence_mod
+
+    monkeypatch.setattr(persistence_mod, "DISK_WRITE_MODE", mode)
+    dm = _make_manager(tmp_path)
+    with caplog.at_level(logging.INFO, logger="fuse4dbricks.perf"):
+        data = await dm._fetch_chunk(_request(dm))
+    assert data == PIECE * N_PIECES
+
+    (bd,) = _events(caplog, "breakdown.v1")
+    ph, det = bd["phases"], bd["detail"]
+    assert set(ph) == EXCLUSIVE_PHASES and set(det) == DETAIL
+    assert bd["disk_write_mode"] == mode
+    assert bd["disk_writes"] == expected_writes
+    assert bd["net_chunks"] == N_PIECES
+    assert det["disk_write_dispatch"] + det["disk_write_syscall"] + det["disk_write_return"] == pytest.approx(
+        ph["disk_write_time"], abs=0.01
+    )
+    assert sum(ph.values()) + bd["residual_ms"] == pytest.approx(bd["total_ms"], abs=0.01)
+    assert bd["residual_ms"] >= 0
+
+
+@pytest.mark.trio
 async def test_breakdown_is_noop_when_disabled(tmp_path, caplog):
     assert profiling.ENABLED is False
     dm = _make_manager(tmp_path)

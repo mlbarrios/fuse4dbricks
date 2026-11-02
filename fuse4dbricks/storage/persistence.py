@@ -17,6 +17,18 @@ from fuse4dbricks.perf import profiling
 
 logger = logging.getLogger(__name__)
 
+# A/B experiment switch for DiskPersistence.store_chunk_from_stream, read once
+# at import time:
+#   "stream" (default, A): one f.write per received piece (128 x 64 KB / 8 MB chunk)
+#   "single" (B): accumulate the whole chunk in memory, then one f.write
+# Only the number of write hops differs; open, close, .tmp + rename, eviction
+# and bookkeeping are identical in both modes.
+DISK_WRITE_MODE = (
+    "single"
+    if os.environ.get("FUSE4DBRICKS_DISK_WRITE_MODE", "").strip().lower() == "single"
+    else "stream"
+)
+
 
 def _timed_write(write, data: bytes) -> tuple[float, float, float]:
     """Profiling-only: runs in the trio worker thread and brackets the blocking
@@ -27,6 +39,40 @@ def _timed_write(write, data: bytes) -> tuple[float, float, float]:
     c_start = time.thread_time()
     write(data)
     return t_start, profiling.now_ms(), (time.thread_time() - c_start) * 1000.0
+
+
+class _WriteStats:
+    """Performs f.write hops and, when profiling is enabled, accumulates the
+    write-hop decomposition:
+      dispatch = submit on loop -> write starts in worker thread
+      syscall  = write starts   -> write returns (in thread)
+      return   = write returns  -> task resumed on loop
+    so dispatch + syscall + return == total."""
+
+    __slots__ = ("cpu_ms", "dispatch_ms", "max_ms", "n", "return_ms", "syscall_ms", "total_ms")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.total_ms = self.dispatch_ms = self.syscall_ms = 0.0
+        self.cpu_ms = self.return_ms = self.max_ms = 0.0
+
+    async def write(self, f, data) -> None:
+        self.n += 1
+        if not profiling.ENABLED:
+            await f.write(data)
+            return
+        t_submit = profiling.now_ms()
+        # Same call AsyncIOWrapper.write makes internally.
+        t_start, t_end, cpu_ms = await trio.to_thread.run_sync(_timed_write, f.wrapped.write, data)
+        t_resume = profiling.now_ms()
+        self.dispatch_ms += t_start - t_submit
+        self.syscall_ms += t_end - t_start
+        self.cpu_ms += cpu_ms
+        self.return_ms += t_resume - t_end
+        w = t_resume - t_submit
+        self.total_ms += w
+        if w > self.max_ms:
+            self.max_ms = w
 
 
 def clear_cache(cache_dir: str):
@@ -193,48 +239,26 @@ class DiskPersistence:
                 )
                 # Note: the download (request, TTFB, network) runs lazily
                 # inside this ``async for``; it is timed by the generator.
-                write_ms = 0.0
-                n_writes = 0
-                # Write-hop decomposition (profiling only): each f.write is a
-                # trio.to_thread.run_sync hop, split into
-                #   dispatch = submit on loop      -> write starts in worker thread
-                #   syscall  = write starts         -> write returns (in thread)
-                #   return   = write returns        -> task resumed on loop
-                # so dispatch + syscall + return == disk_write_time.
-                timed = profiling.ENABLED
-                raw_write = f.wrapped.write if timed else None
-                dispatch_ms = syscall_ms = syscall_cpu_ms = return_ms = 0.0
-                max_write_ms = 0.0
+                single_write = DISK_WRITE_MODE == "single"
+                ws = _WriteStats()
                 async for chunk in stream:
-                    if timed:
-                        t_submit = profiling.now_ms()
-                        # Same call AsyncIOWrapper.write makes internally.
-                        t_start, t_end, cpu_ms = await trio.to_thread.run_sync(
-                            _timed_write, raw_write, chunk
-                        )
-                        t_resume = profiling.now_ms()
-                        dispatch_ms += t_start - t_submit
-                        syscall_ms += t_end - t_start
-                        syscall_cpu_ms += cpu_ms
-                        return_ms += t_resume - t_end
-                        w = t_resume - t_submit
-                        write_ms += w
-                        if w > max_write_ms:
-                            max_write_ms = w
-                    else:
-                        await f.write(chunk)
-                    n_writes += 1
+                    if not single_write:
+                        await ws.write(f, chunk)
                     bytes_written += len(chunk)
                     result.extend(chunk)
+                if single_write and result:
+                    # B: the whole chunk is already buffered in ``result``
+                    # (it is returned to the caller anyway): one write hop.
+                    await ws.write(f, result)
                 profiling.record_phase(
-                    "disk_write_time", write_ms, path=fs_path, category="cache",
-                    nbytes=bytes_written, disk_writes=n_writes,
-                    disk_write_max_ms=round(max_write_ms, 3),
+                    "disk_write_time", ws.total_ms, path=fs_path, category="cache",
+                    nbytes=bytes_written, disk_writes=ws.n,
+                    disk_write_max_ms=round(ws.max_ms, 3), disk_write_mode=DISK_WRITE_MODE,
                 )
-                profiling.record_phase("disk_write_dispatch", dispatch_ms, path=fs_path, category="cache", exclusive=False)
-                profiling.record_phase("disk_write_syscall", syscall_ms, path=fs_path, category="cache", exclusive=False)
-                profiling.record_phase("disk_write_syscall_cpu", syscall_cpu_ms, path=fs_path, category="cache", exclusive=False)
-                profiling.record_phase("disk_write_return", return_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_dispatch", ws.dispatch_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_syscall", ws.syscall_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_syscall_cpu", ws.cpu_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_return", ws.return_ms, path=fs_path, category="cache", exclusive=False)
                 t_close = profiling.now_ms()
             profiling.record_phase(
                 "disk_close", profiling.now_ms() - t_close, path=fs_path, category="cache",
