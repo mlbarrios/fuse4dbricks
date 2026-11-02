@@ -18,6 +18,17 @@ from fuse4dbricks.perf import profiling
 logger = logging.getLogger(__name__)
 
 
+def _timed_write(write, data: bytes) -> tuple[float, float, float]:
+    """Profiling-only: runs in the trio worker thread and brackets the blocking
+    write with thread-side timestamps. Returns (start_ms, end_ms, cpu_ms) on
+    the same monotonic clock as ``profiling.now_ms`` so they can be compared
+    with the event-loop-side submit/resume timestamps."""
+    t_start = profiling.now_ms()
+    c_start = time.thread_time()
+    write(data)
+    return t_start, profiling.now_ms(), (time.thread_time() - c_start) * 1000.0
+
+
 def clear_cache(cache_dir: str):
     """Removes *.tmp and *.bin files from cache_dir recursively"""
     logging.info("Clearing cache... %s", cache_dir)
@@ -184,17 +195,46 @@ class DiskPersistence:
                 # inside this ``async for``; it is timed by the generator.
                 write_ms = 0.0
                 n_writes = 0
+                # Write-hop decomposition (profiling only): each f.write is a
+                # trio.to_thread.run_sync hop, split into
+                #   dispatch = submit on loop      -> write starts in worker thread
+                #   syscall  = write starts         -> write returns (in thread)
+                #   return   = write returns        -> task resumed on loop
+                # so dispatch + syscall + return == disk_write_time.
+                timed = profiling.ENABLED
+                raw_write = f.wrapped.write if timed else None
+                dispatch_ms = syscall_ms = syscall_cpu_ms = return_ms = 0.0
+                max_write_ms = 0.0
                 async for chunk in stream:
-                    t_w = profiling.now_ms()
-                    await f.write(chunk)
-                    write_ms += profiling.now_ms() - t_w
+                    if timed:
+                        t_submit = profiling.now_ms()
+                        # Same call AsyncIOWrapper.write makes internally.
+                        t_start, t_end, cpu_ms = await trio.to_thread.run_sync(
+                            _timed_write, raw_write, chunk
+                        )
+                        t_resume = profiling.now_ms()
+                        dispatch_ms += t_start - t_submit
+                        syscall_ms += t_end - t_start
+                        syscall_cpu_ms += cpu_ms
+                        return_ms += t_resume - t_end
+                        w = t_resume - t_submit
+                        write_ms += w
+                        if w > max_write_ms:
+                            max_write_ms = w
+                    else:
+                        await f.write(chunk)
                     n_writes += 1
                     bytes_written += len(chunk)
                     result.extend(chunk)
                 profiling.record_phase(
                     "disk_write_time", write_ms, path=fs_path, category="cache",
                     nbytes=bytes_written, disk_writes=n_writes,
+                    disk_write_max_ms=round(max_write_ms, 3),
                 )
+                profiling.record_phase("disk_write_dispatch", dispatch_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_syscall", syscall_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_syscall_cpu", syscall_cpu_ms, path=fs_path, category="cache", exclusive=False)
+                profiling.record_phase("disk_write_return", return_ms, path=fs_path, category="cache", exclusive=False)
                 t_close = profiling.now_ms()
             profiling.record_phase(
                 "disk_close", profiling.now_ms() - t_close, path=fs_path, category="cache",

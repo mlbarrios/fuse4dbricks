@@ -6,6 +6,7 @@ DataManager._fetch_chunk -> real UnityCatalogClient.download_chunk_stream
 
 import json
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -41,6 +42,10 @@ DETAIL = {
     "cache_evict",
     "cache_lock_wait",
     "cache_metadata_update",
+    "disk_write_dispatch",
+    "disk_write_syscall",
+    "disk_write_syscall_cpu",
+    "disk_write_return",
 }
 
 
@@ -144,13 +149,23 @@ async def test_phases_do_not_double_count_disk_and_network(enabled, tmp_path, ca
     write_s = 0.02
     real_open = trio.open_file
 
+    class _BlockingRaw:
+        """Thread-side file: blocks the worker thread like a slow device."""
+
+        def __init__(self, raw):
+            self._raw = raw
+
+        def write(self, b):
+            time.sleep(write_s)
+            return self._raw.write(b)
+
     class _SlowFile:
         def __init__(self, f):
             self._f = f
+            self.wrapped = _BlockingRaw(f.wrapped)
 
         async def write(self, b):
-            await trio.sleep(write_s)
-            return await self._f.write(b)
+            return await trio.to_thread.run_sync(self.wrapped.write, b)
 
         async def __aenter__(self):
             return self
@@ -183,6 +198,17 @@ async def test_phases_do_not_double_count_disk_and_network(enabled, tmp_path, ca
     )
     assert bd["residual_ms"] >= 0
     assert sum(ph.values()) <= bd["total_ms"]
+
+    # Write-hop decomposition: the blocking delay lands in the in-thread
+    # syscall component (as wall time, not CPU time), and the three
+    # components reconstruct disk_write_time exactly.
+    assert det["disk_write_syscall"] >= write_ms * 0.9
+    assert det["disk_write_syscall_cpu"] < write_ms * 0.5
+    assert det["disk_write_dispatch"] >= 0 and det["disk_write_return"] >= 0
+    assert det["disk_write_dispatch"] + det["disk_write_syscall"] + det["disk_write_return"] == pytest.approx(
+        ph["disk_write_time"], abs=0.01
+    )
+    assert write_s * 1000 * 0.9 <= bd["disk_write_max_ms"] <= ph["disk_write_time"]
 
 
 @pytest.mark.trio
