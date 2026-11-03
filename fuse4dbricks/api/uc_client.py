@@ -735,7 +735,7 @@ class UnityCatalogClient:
 
         try:
             # Yield data in increments of 64KB
-            async for chunk in response.aiter_bytes(chunk_size=65536):
+            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                 yield chunk
         finally:
             # Crucial: close the stream to release the connection back to the pool
