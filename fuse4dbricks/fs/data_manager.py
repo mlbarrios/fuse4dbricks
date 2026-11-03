@@ -116,18 +116,24 @@ class DownloadScheduler:
 
 
 class DataManager:
-    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10):
+    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefetch_mb=80, prefetch_to_ram: bool = True):
         """
         uc_client: client to download chunks from UC
         persistence: where to store downloaded chunks on disk
         ram_cache_mb: how much RAM to use for caching chunks in memory (LRU eviction)
         num_workers: how many concurrent downloads to allow
+        prefetch_to_ram: also keep freshly prefetched chunks in the RAM cache,
+            so the read that reaches them does not have to read them back from
+            disk (and concurrent reads of the same chunk do not each do so)
         """
         self.uc_client = uc_client
         self.persistence = persistence
         self.chunk_size = 8 * 1024 * 1024
         self._inflight_coalescer: InflightCoalescer[_CacheKey] = InflightCoalescer()
         "Inflight coalescer for downloads identified by (fs_path, chunk_id, mtime, gen)"
+
+        if num_workers < 1:
+            raise ValueError("num_workers must be >= 1")
 
         self._download_scheduler = DownloadScheduler(process_request=self._process_request, num_workers=num_workers)
 
@@ -138,6 +144,12 @@ class DataManager:
         # max number of chunks to cache in memory
         max_ram_chunks = int(ram_cache_mb*1024*1024 / self.chunk_size)
         self._ram_cache: RamCache[_CacheKey] = RamCache(max_entries = max_ram_chunks)
+        prefetch_bytes = prefetch_mb * 1024 * 1024
+        chunks_to_prefetch = int(prefetch_bytes / self.chunk_size)
+        if chunks_to_prefetch < 0:
+            chunks_to_prefetch = 0
+        self._chunks_to_prefetch = chunks_to_prefetch
+        self._prefetch_to_ram = prefetch_to_ram
 
     def close(self) -> None:
         self._download_scheduler.close()
@@ -173,7 +185,14 @@ class DataManager:
                 # not even be read; a plain existence check is enough to
                 # decide whether a download is needed.
                 if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
-                    await self._fetch_chunk(chunk_request)
+                    chunk = await self._fetch_chunk(chunk_request)
+                    # The bytes are already in memory (store_chunk_from_stream
+                    # returns them), so keeping them costs no extra I/O or copy
+                    # and saves the reader an 8 MiB read-back from disk. Chunks
+                    # that were already on disk are NOT loaded: that read-back
+                    # is exactly what the existence check avoids.
+                    if self._prefetch_to_ram:
+                        await self._ram_cache.put(cache_key, chunk)
         finally:
             await self._inflight_coalescer.notify_done(cache_key)
 
@@ -204,6 +223,14 @@ class DataManager:
 
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, gen: int, ctx: pyfuse3.RequestContext):
         for (chunk_id, chunk_size) in chunks_to_prefetch:
+            # Already on disk: nothing to prefetch. Without this check, a chunk
+            # that finished downloading (and so left the coalescer) was
+            # re-enqueued on every read until the reader reached it: 64 reads
+            # per 8 MiB chunk x up to N prefetch chunks, each costing a worker
+            # wake-up and a chunk_exists() thread hop. has_chunk() is a
+            # synchronous in-RAM lookup.
+            if self.persistence.has_chunk(fs_path, chunk_id, mtime, gen):
+                continue
             cache_key = (fs_path, chunk_id, mtime, gen)
             (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
             if not leader:
@@ -296,7 +323,7 @@ class DataManager:
                         self._read_chunk, fs_path, chunk_id, mtime, gen, chunk_size, ctx, chunks
                     )
         # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
-        num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
+        num_chunks_to_prefetch = self._chunks_to_prefetch if end_chunk > 0 else min(1, self._chunks_to_prefetch)
         chunks_to_prefetch = []
         for i in range(num_chunks_to_prefetch):
             chunk_to_prefetch = end_chunk + 1 + i

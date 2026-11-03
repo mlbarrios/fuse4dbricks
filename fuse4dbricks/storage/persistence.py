@@ -40,6 +40,20 @@ def _path_hash(fs_path: str) -> str:
     return hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
 
 
+# access_map value marking an indexed chunk whose file turned out to be missing
+# (deleted behind our back). Real access times are always > 0. The entry is
+# kept, not deleted, so that its size is still released from current_size when
+# evict() later pops the matching access_log record and finds the file gone.
+_MISSING = 0.0
+
+
+@lru_cache(maxsize=4096)
+def _path_hash(fs_path: str) -> str:
+    """sha256 of an fs_path. Cached: has_chunk() runs for every prefetch
+    candidate of every read, and hashing dominated its cost."""
+    return hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
+
+
 def clear_cache(cache_dir: str):
     """Removes *.tmp and *.bin files from cache_dir recursively"""
     logging.info("Clearing cache... %s", cache_dir)

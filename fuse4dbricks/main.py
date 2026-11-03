@@ -96,6 +96,26 @@ def parse_args():
         help="Default TTL for metadata cache entries in seconds",
     )
     parser.add_argument(
+        "--prefetch_mb",
+        type=int,
+        default=80,
+        help="Amount of data to prefetch in MB for each file",
+    )
+    parser.add_argument(
+        "--prefetch-to-ram",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep prefetched chunks in the RAM cache as well as on disk, so "
+        "sequential reads do not read them back from disk "
+        "(--no-prefetch-to-ram: disk only)",
+    )
+    parser.add_argument(
+        "--num-download-workers",
+        type=int,
+        default=10,
+        help="Number of concurrent download workers",
+    )
+    parser.add_argument(
         "--metadata-cache-ttl-catalog-sec",
         type=int,
         default=600,
@@ -242,7 +262,7 @@ async def async_main():
     persistence = DiskPersistence(data_cache_dir, max_size_gb=args.disk_cache_gb, max_age_days=args.disk_cache_max_days)
 
     inode_manager = InodeManager()
-    data_manager = DataManager(uc_client, persistence, ram_cache_mb=args.ram_cache_mb)
+    data_manager = DataManager(uc_client, persistence, ram_cache_mb=args.ram_cache_mb, num_workers=args.num_download_workers, prefetch_mb=args.prefetch_mb, prefetch_to_ram=args.prefetch_to_ram)
     metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec, ttl_negative=args.metadata_cache_ttl_negative_sec, inode_manager=inode_manager)
     # On a 401, the token is invalidated and re-resolved (possibly to a
     # different principal); drop the cached principal so authz re-derives it.

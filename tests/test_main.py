@@ -31,6 +31,11 @@ def test_parse_args_defaults(monkeypatch):
     assert args.metadata_cache_ttl_catalog_sec == 600
 
 
+def test_parse_args_prefetch_to_ram(monkeypatch):
+    assert _run_parse(["/mnt/point"], monkeypatch).prefetch_to_ram is True
+    assert _run_parse(["/mnt/point", "--no-prefetch-to-ram"], monkeypatch).prefetch_to_ram is False
+
+
 def test_parse_args_no_unified_auth(monkeypatch):
     args = _run_parse(["/mnt/point", "--no-unified-auth"], monkeypatch)
     assert args.unified_auth is False

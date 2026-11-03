@@ -1,3 +1,30 @@
+# 0.7.9 (2026-10-31)
+
+- Fix prefetch re-queueing chunks that had already been downloaded. A
+  finished prefetch was forgotten, so every following read requested it
+  again until the reader reached it: up to 64 reads per 8 MiB chunk for
+  each chunk in the prefetch window. Each one woke a download worker and
+  checked the disk from a thread. Reading a large file sequentially was
+  CPU-bound, and raising `--prefetch_mb` made it slower. The disk cache
+  now keeps an in-memory index of the chunks it holds, and prefetch skips
+  them.
+- Keep prefetched chunks in the RAM cache as well as on disk, so the read
+  that reaches a chunk no longer reads 8 MiB back from disk first, and
+  concurrent reads of the same chunk no longer each read it back.
+  Enabled by default; `--no-prefetch-to-ram` restores disk-only prefetch.
+- Add `tests/sim_sequential_read.py`, a simulator that drives the real
+  `DataManager` against a bandwidth-limited fake Databricks and disk
+  cache. It reports where time goes in a large sequential read.
+
+# 0.7.8 (2026-10-15)
+
+- Fix typo in DataManager
+
+# 0.7.7 (2026-10-01)
+
+- Add --num-download-workers and --prefetch-mb to control prefetching
+  and parallel downloads.
+
 # 0.7.6 (2026-08-07)
 
 - Force push. Bump for traceability.
