@@ -207,7 +207,17 @@ class UnityCatalogClient:
             raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 400:
-            raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
+            print("\n===== 400 RESPONSE =====")
+            print(resp.text)
+            print("========================\n")
+
+            raise UcBadRequest(
+                msg,
+                status_code=400,
+                uc_path=uc_path,
+                url=url,
+                request_id=request_id,
+            )
 
         if resp.status_code == 412:
             # Precondition failed: the file changed under an If-Unmodified-Since
