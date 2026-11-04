@@ -706,6 +706,21 @@ class UnityCatalogClient:
         await self._request(
             "PUT", f"/api/2.0/fs/directories{encoded_path}", ctx=ctx, uc_path=uc_path
         )
+    
+    async def get_download_url(
+        self,
+        path: str,
+        *,
+        ctx: pyfuse3.RequestContext,
+    ):
+        response = await self._request(
+            "POST",
+            "/api/2.0/fs/create-download-url",
+            ctx=ctx,
+            uc_path=path,
+        )
+        return response
+
 
     async def download_chunk_stream(
         self,
