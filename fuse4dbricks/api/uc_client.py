@@ -723,13 +723,22 @@ class UnityCatalogClient:
         *,
         ctx: pyfuse3.RequestContext,
     ):
-        response = await self._request(
-            "POST",
+        headers = await self._get_headers(ctx)
+        
+        response = await self.client.post(
             "/api/2.0/fs/create-download-url",
-            ctx=ctx,
-            uc_path=path,
+            headers=headers,
+            json={
+            "path": path,
+            },
         )
-        return response
+        
+        print("STATUS:", response.status_code)
+        print("BODY:", response.text)
+        
+        response.raise_for_status()
+
+        return response.json()
 
 
     async def download_chunk_stream(
