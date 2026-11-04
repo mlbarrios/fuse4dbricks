@@ -1,16 +1,21 @@
 from datetime import datetime, timezone
+import logging
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+import urllib3
 
 import pyfuse3
 
-from fuse4dbricks.api.uc_client import UnityCatalogClient, _parse_retry_after
+from fuse4dbricks.api.uc_client import PresignedDownloadUrl, UnityCatalogClient, _parse_retry_after
 from fuse4dbricks.api.errors import (
     UcBadRequest,
     UcError,
     UcNotFound,
+    UcPermissionDenied,
     UcPreconditionFailed,
     UcRateLimited,
     UcUnavailable,
@@ -534,3 +539,283 @@ async def test_upload_file_refreshes_token_on_401(client, mock_auth_provider, tm
     assert seen_tokens == ["stale", "fresh"]
     mock_auth_provider.invalidate_access_token.assert_called_once()
     assert mock_auth_provider.get_access_token.await_count == 2
+
+
+# --- TESTS: PRESIGNED (DIRECT-TO-STORAGE) DOWNLOADS ---
+
+_SECRET_URL = "https://acct.blob.core.windows.net/c/blob?sv=2021&sig=SECRET-SIGNATURE"
+_SECRET_URL_2 = "https://acct.blob.core.windows.net/c/blob?sv=2021&sig=SECRET-SIGNATURE-2"
+
+
+def _presigned(url=_SECRET_URL, expires_in=600.0):
+    return PresignedDownloadUrl(
+        url=url,
+        headers={"x-ms-version": "2021-04-10"},
+        expires_at=time.monotonic() + expires_in,
+    )
+
+
+async def _collect(agen):
+    return b"".join([piece async for piece in agen])
+
+
+def _files_api_fallback(data=b"from-files-api"):
+    """Replacement for download_chunk_stream recording its calls."""
+    calls = []
+
+    async def fake(path, offset, length, *, ctx, if_unmodified_since=None):
+        calls.append((path, offset, length, if_unmodified_since))
+        yield data
+
+    return fake, calls
+
+
+@pytest.mark.trio
+async def test_get_download_url_request_and_parsing(client):
+    """POST create-download-url with path/expire_time query params (as the SDK
+    does) and parse the URL plus required headers."""
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = 200
+    response.json.return_value = {
+        "url": _SECRET_URL,
+        "headers": [{"name": "x-ms-version", "value": "2021-04-10"}],
+    }
+    client.client.send.return_value = response
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    presigned = await client.get_download_url("/Volumes/c/s/v/f.bin", ctx=ctx)
+
+    method, endpoint = client.client.build_request.call_args[0]
+    params = client.client.build_request.call_args[1]["params"]
+    assert (method, endpoint) == ("POST", "/api/2.0/fs/create-download-url")
+    assert params["path"] == "/Volumes/c/s/v/f.bin"
+    datetime.strptime(params["expire_time"], "%Y-%m-%dT%H:%M:%SZ")
+    assert presigned.url == _SECRET_URL
+    assert presigned.headers == {"x-ms-version": "2021-04-10"}
+    assert presigned.expires_at > time.monotonic()
+    assert "SECRET" not in repr(presigned)
+
+
+@pytest.mark.trio
+async def test_get_download_url_rejects_response_without_url(client):
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = 200
+    response.json.return_value = {"headers": []}
+    client.client.send.return_value = response
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    with pytest.raises(UcError):
+        await client.get_download_url("/Volumes/c/s/v/f.bin", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_presigned_download_reads_range_from_storage_and_caches_url(client):
+    client.get_download_url = AsyncMock(return_value=_presigned())
+    client._storage_get_blocking = MagicMock(return_value=(206, b"x" * 100))
+    fallback, fallback_calls = _files_api_fallback()
+    client.download_chunk_stream = fallback
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    mtime = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    for _ in range(2):
+        data = await _collect(client.download_chunk_stream_presigned(
+            "/Volumes/c/s/v/f.bin", 8 * 1024 * 1024, 100, ctx=ctx, if_unmodified_since=mtime,
+        ))
+        assert data == b"x" * 100
+
+    client.get_download_url.assert_awaited_once()  # second chunk reuses the cached URL
+    assert fallback_calls == []
+    _pool, url, headers, length, accept_200 = client._storage_get_blocking.call_args[0]
+    assert url == _SECRET_URL
+    assert headers["Range"] == "bytes=8388608-8388707"
+    assert headers["If-Unmodified-Since"] == "Sun, 01 Feb 2026 12:00:00 GMT"
+    assert headers["x-ms-version"] == "2021-04-10"
+    assert "Authorization" not in headers  # the signature is the credential
+    assert (length, accept_200) == (100, False)
+
+
+@pytest.mark.trio
+async def test_presigned_url_cache_is_per_uid(client):
+    # pyfuse3.RequestContext() ignores its arguments (uid is always 0), so use
+    # plain objects: the client only reads ctx.uid / ctx.pid.
+    client.get_download_url = AsyncMock(return_value=_presigned())
+    client._storage_get_blocking = MagicMock(return_value=(206, b"x" * 10))
+
+    for uid in (1000, 1001, 1000):
+        ctx = SimpleNamespace(uid=uid, pid=1234, gid=1000)
+        await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx))
+
+    assert client.get_download_url.await_count == 2
+
+
+@pytest.mark.trio
+async def test_presigned_url_refreshed_when_expired(client):
+    client.get_download_url = AsyncMock(
+        side_effect=[_presigned(expires_in=-1.0), _presigned(_SECRET_URL_2)]
+    )
+    client._storage_get_blocking = MagicMock(return_value=(206, b"x" * 10))
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    for _ in range(2):
+        await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx))
+
+    assert client.get_download_url.await_count == 2
+    assert client._storage_get_blocking.call_args[0][1] == _SECRET_URL_2
+
+
+@pytest.mark.trio
+async def test_presigned_403_refreshes_url_once_then_succeeds(client):
+    client.get_download_url = AsyncMock(side_effect=[_presigned(), _presigned(_SECRET_URL_2)])
+    client._storage_get_blocking = MagicMock(side_effect=[(403, b""), (206, b"x" * 10)])
+    fallback, fallback_calls = _files_api_fallback()
+    client.download_chunk_stream = fallback
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    data = await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx))
+
+    assert data == b"x" * 10
+    assert client.get_download_url.await_count == 2
+    assert client._storage_get_blocking.call_args_list[1][0][1] == _SECRET_URL_2
+    assert fallback_calls == []
+
+
+@pytest.mark.trio
+async def test_presigned_repeated_403_falls_back_without_logging_url(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    client.get_download_url = AsyncMock(side_effect=[_presigned(), _presigned(_SECRET_URL_2)])
+    client._storage_get_blocking = MagicMock(return_value=(403, b""))
+    fallback, fallback_calls = _files_api_fallback()
+    client.download_chunk_stream = fallback
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    data = await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx))
+
+    assert data == b"from-files-api"
+    assert fallback_calls == [("/Volumes/c/s/v/f.bin", 0, 10, None)]
+    assert "SECRET" not in caplog.text
+    assert "using the Files API" in caplog.text
+
+
+@pytest.mark.trio
+async def test_presigned_falls_back_when_create_download_url_fails(client):
+    client.get_download_url = AsyncMock(
+        side_effect=UcPermissionDenied("Databricks API error 403", status_code=403)
+    )
+    client._storage_get_blocking = MagicMock()
+    fallback, fallback_calls = _files_api_fallback()
+    client.download_chunk_stream = fallback
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    for offset in (0, 10):
+        data = await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", offset, 10, ctx=ctx))
+        assert data == b"from-files-api"
+
+    # The failure is remembered: the second chunk goes straight to the Files API.
+    client.get_download_url.assert_awaited_once()
+    client._storage_get_blocking.assert_not_called()
+    assert [call[1] for call in fallback_calls] == [0, 10]
+
+
+@pytest.mark.trio
+async def test_presigned_412_defers_to_files_api(client):
+    """Storage's Last-Modified may not match Unity Catalog's mtime exactly, so a
+    412 is re-checked through the Files API, which raises UcPreconditionFailed
+    if the file really changed."""
+    client.get_download_url = AsyncMock(return_value=_presigned())
+    client._storage_get_blocking = MagicMock(return_value=(412, b""))
+    fallback, fallback_calls = _files_api_fallback()
+    client.download_chunk_stream = fallback
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    data = await _collect(client.download_chunk_stream_presigned(
+        "/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx, if_unmodified_since=1.0
+    ))
+
+    assert data == b"from-files-api"
+    assert fallback_calls == [("/Volumes/c/s/v/f.bin", 0, 10, 1.0)]
+    # A 412 is about this file version, not about presigned URLs: not remembered.
+    assert client._presigned_failures == {}
+
+
+@pytest.mark.trio
+async def test_presigned_retries_transient_errors_and_short_reads(client, backoff):
+    client.get_download_url = AsyncMock(return_value=_presigned())
+    client._storage_get_blocking = MagicMock(
+        side_effect=[
+            (503, b""),
+            urllib3.exceptions.ReadTimeoutError(None, _SECRET_URL, "read timed out"),
+            (206, b"x" * 5),  # short read
+            (206, b"x" * 10),
+        ]
+    )
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    data = await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx))
+
+    assert data == b"x" * 10
+    assert len(backoff) == 3
+
+
+@pytest.mark.trio
+async def test_presigned_200_only_accepted_at_offset_zero(client):
+    """A 200 means storage ignored Range and sent the blob from its start:
+    usable for a chunk at offset 0, wrong data for any other chunk."""
+    client.get_download_url = AsyncMock(return_value=_presigned())
+    client._storage_get_blocking = MagicMock(return_value=(200, b"x" * 10))
+    fallback, fallback_calls = _files_api_fallback()
+    client.download_chunk_stream = fallback
+
+    ctx = pyfuse3.RequestContext(uid=1000, pid=1234, gid=1000)
+    assert await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 0, 10, ctx=ctx)) == b"x" * 10
+
+    data = await _collect(client.download_chunk_stream_presigned("/Volumes/c/s/v/f.bin", 10, 10, ctx=ctx))
+    assert data == b"from-files-api"
+    assert len(fallback_calls) == 1
+
+
+def _storage_response(status, body=b"", closed=True):
+    resp = MagicMock()
+    resp.status = status
+    resp.read.return_value = body
+    resp.closed = closed
+    return resp
+
+
+def test_storage_get_blocking_reads_exactly_the_range():
+    pool = MagicMock()
+    pool.request.return_value = _storage_response(206, b"x" * 10)
+
+    status, body = UnityCatalogClient._storage_get_blocking(
+        pool, _SECRET_URL, {"Range": "bytes=0-9"}, 10, False
+    )
+
+    assert (status, body) == (206, b"x" * 10)
+    pool.request.return_value.read.assert_called_once_with(10)
+    kwargs = pool.request.call_args[1]
+    assert kwargs["preload_content"] is False
+    assert kwargs["redirect"] is False
+    pool.request.return_value.close.assert_not_called()  # connection returned to the pool
+
+
+def test_storage_get_blocking_drops_unread_error_response():
+    pool = MagicMock()
+    pool.request.return_value = _storage_response(403, closed=False)
+
+    status, body = UnityCatalogClient._storage_get_blocking(
+        pool, _SECRET_URL, {"Range": "bytes=10-19"}, 10, False
+    )
+
+    assert (status, body) == (403, b"")
+    pool.request.return_value.read.assert_not_called()
+    pool.request.return_value.close.assert_called_once()
+
+
+def test_storage_pool_suppresses_urllib3_debug_request_lines(client):
+    pool_logger = logging.getLogger("urllib3.connectionpool")
+    previous = pool_logger.level
+    pool_logger.setLevel(logging.DEBUG)
+    try:
+        client._get_storage_pool()
+        assert pool_logger.level == logging.INFO
+    finally:
+        pool_logger.setLevel(previous)

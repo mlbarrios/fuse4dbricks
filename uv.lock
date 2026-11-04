@@ -361,6 +361,7 @@ dependencies = [
     { name = "platformdirs", marker = "sys_platform != 'win32'" },
     { name = "pyfuse3" },
     { name = "trio" },
+    { name = "urllib3" },
 ]
 
 [package.dev-dependencies]
@@ -382,6 +383,7 @@ requires-dist = [
     { name = "platformdirs", marker = "sys_platform != 'win32'" },
     { name = "pyfuse3", specifier = ">=3.4.2" },
     { name = "trio", specifier = ">=0.22.0" },
+    { name = "urllib3", specifier = ">=2" },
 ]
 
 [package.metadata.requires-dev]

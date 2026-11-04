@@ -18,6 +18,17 @@ To mitigate latency and improve **performance**, file metadata is cached in-memo
 to a local cache directory (`--disk-cache-dir`) and partially to RAM as well. Options to control
 the sizes of those caches are available.
 
+**Experimental: presigned downloads.** By default, file data is read through the Files API
+(`GET /api/2.0/fs/files`), which proxies every byte through the Databricks workspace. With
+`--use-presigned-downloads`, fuse4dbricks instead asks for a short-lived presigned URL
+(`POST /api/2.0/fs/create-download-url`, the mechanism the Databricks SDK uses for
+`files.download()`) and reads byte ranges directly from cloud storage, which can be
+substantially faster. URLs are cached per user and file for up to 15 minutes, so revoking a
+user's access may take that long to stop reads already in progress. If a presigned URL cannot
+be created, or storage refuses a request, the read falls back to the Files API automatically.
+This requires the client machine to reach the storage account directly (no firewall or
+private-endpoint restriction blocking it).
+
 **Credentials** are stored in RAM while the filesystem is mounted.
 
 `DATABRICKS_TOKEN`, `DATABRICKS_CONFIG_PROFILE` and `DATABRICKS_CONFIG_FILE` are used to find the databricks configuration file and obtain a valid access token. Alternatively, credentials can be passed by writing a

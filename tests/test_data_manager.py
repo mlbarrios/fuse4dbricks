@@ -392,6 +392,32 @@ async def test_prefetch_to_ram_flag_reaches_data_manager():
     assert DM(uc_client=MagicMock(), persistence=MagicMock(), prefetch_to_ram=False)._prefetch_to_ram is False
 
 
+@pytest.mark.trio
+@pytest.mark.parametrize("use_presigned", [False, True])
+async def test_fetch_chunk_selects_download_path(use_presigned):
+    """--use-presigned-downloads only swaps the download method; the arguments
+    and the persistence call are identical either way."""
+    uc_client = MagicMock()
+    persistence = MagicMock()
+    persistence.store_chunk_from_stream = AsyncMock(return_value=b"data")
+    dm = DataManager(uc_client=uc_client, persistence=persistence, use_presigned_downloads=use_presigned)
+    request = _ChunkRequest(
+        fs_path="/c/s/v/f", chunk_id=2, mtime=100.0, gen=0,
+        chunk_size=1234, ctx=SimpleNamespace(uid=1000, pid=1, gid=1000),
+    )
+
+    assert await dm._fetch_chunk(request) == b"data"
+
+    used = uc_client.download_chunk_stream_presigned if use_presigned else uc_client.download_chunk_stream
+    unused = uc_client.download_chunk_stream if use_presigned else uc_client.download_chunk_stream_presigned
+    used.assert_called_once_with(
+        path="/Volumes/c/s/v/f", offset=2 * dm.chunk_size, length=1234,
+        ctx=request.ctx, if_unmodified_since=100.0,
+    )
+    unused.assert_not_called()
+    assert persistence.store_chunk_from_stream.call_args[1]["stream"] is used.return_value
+
+
 # ---------------------------------------------------------------------------
 # Tests: cache generation (invalidate_path)
 # ---------------------------------------------------------------------------

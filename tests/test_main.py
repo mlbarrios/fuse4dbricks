@@ -36,6 +36,11 @@ def test_parse_args_prefetch_to_ram(monkeypatch):
     assert _run_parse(["/mnt/point", "--no-prefetch-to-ram"], monkeypatch).prefetch_to_ram is False
 
 
+def test_parse_args_use_presigned_downloads(monkeypatch):
+    assert _run_parse(["/mnt/point"], monkeypatch).use_presigned_downloads is False
+    assert _run_parse(["/mnt/point", "--use-presigned-downloads"], monkeypatch).use_presigned_downloads is True
+
+
 def test_parse_args_no_unified_auth(monkeypatch):
     args = _run_parse(["/mnt/point", "--no-unified-auth"], monkeypatch)
     assert args.unified_auth is False

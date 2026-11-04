@@ -116,7 +116,7 @@ class DownloadScheduler:
 
 
 class DataManager:
-    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefetch_mb=80, prefetch_to_ram: bool = True):
+    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefetch_mb=80, prefetch_to_ram: bool = True, use_presigned_downloads: bool = False):
         """
         uc_client: client to download chunks from UC
         persistence: where to store downloaded chunks on disk
@@ -125,9 +125,12 @@ class DataManager:
         prefetch_to_ram: also keep freshly prefetched chunks in the RAM cache,
             so the read that reaches them does not have to read them back from
             disk (and concurrent reads of the same chunk do not each do so)
+        use_presigned_downloads: experimental; read chunks directly from cloud
+            storage through presigned URLs, falling back to the Files API
         """
         self.uc_client = uc_client
         self.persistence = persistence
+        self._use_presigned_downloads = use_presigned_downloads
         self.chunk_size = 8 * 1024 * 1024
         self._inflight_coalescer: InflightCoalescer[_CacheKey] = InflightCoalescer()
         "Inflight coalescer for downloads identified by (fs_path, chunk_id, mtime, gen)"
@@ -205,7 +208,12 @@ class DataManager:
         uc_path = fs_to_uc_path(chunk_request.fs_path)
         offset = self.chunk_size * chunk_request.chunk_id
         length = chunk_request.chunk_size
-        stream = self.uc_client.download_chunk_stream(
+        download = (
+            self.uc_client.download_chunk_stream_presigned
+            if self._use_presigned_downloads
+            else self.uc_client.download_chunk_stream
+        )
+        stream = download(
             path=uc_path,
             offset=offset,
             length=length,
