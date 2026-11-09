@@ -16,29 +16,6 @@ import trio
 
 logger = logging.getLogger(__name__)
 
-# A/B experiment:
-#   stream -> comportamiento actual (un write por bloque recibido)
-#   single -> acumular el chunk completo y hacer un único write
-
-DISK_WRITE_MODE = (
-    "single"
-    if os.environ.get("FUSE4DBRICKS_DISK_WRITE_MODE", "").strip().lower() == "single"
-    else "stream"
-)
-
-# access_map value marking an indexed chunk whose file turned out to be missing
-# (deleted behind our back). Real access times are always > 0. The entry is
-# kept, not deleted, so that its size is still released from current_size when
-# evict() later pops the matching access_log record and finds the file gone.
-_MISSING = 0.0
-
-
-@lru_cache(maxsize=4096)
-def _path_hash(fs_path: str) -> str:
-    """sha256 of an fs_path. Cached: has_chunk() runs for every prefetch
-    candidate of every read, and hashing dominated its cost."""
-    return hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
-
 
 # access_map value marking an indexed chunk whose file turned out to be missing
 # (deleted behind our back). Real access times are always > 0. The entry is
@@ -233,24 +210,28 @@ class DiskPersistence:
         temp_path = f"{cache_path}.{os.getpid()}.tmp"
         result = bytearray()
         bytes_written = 0
+
         try:
             # The shard dir is created lazily here (off-thread), only when we
             # actually write a chunk — not on every read in _get_chunk_path.
             await trio.to_thread.run_sync(self._ensure_parent_dir, cache_path)
 
-            # Write to .tmp (No lock needed)
+            # Accumulate the chunk and persist it with a single write operation.
+            #
+            # Fuse4dbricks operates on fixed-size chunks (typically 8 MiB). Writing
+            # the completed chunk at once avoids many smaller write syscalls and
+            # improves cache-write throughput.
+            #
+            # The chunk is already accumulated here because it is returned to the
+            # caller for RAM caching, so persisting it with a single write does not
+            # introduce additional buffering.
             async with await trio.open_file(temp_path, "wb") as f:
-                single_write = DISK_WRITE_MODE == "single"
-
                 async for chunk in stream:
                     bytes_written += len(chunk)
                     result.extend(chunk)
 
-                    if not single_write:
-                        await f.write(chunk)
-
-                if single_write and result:
-                    await f.write(result)            
+                if result:
+                    await f.write(result)
 
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
@@ -260,16 +241,17 @@ class DiskPersistence:
 
             # 2. UPDATE METADATA (Acquire Lock)
             async with self.lock:
-                # If overwriting, logic could go here to subtract old size
                 self.current_size += bytes_written
                 now = time.time()
                 self.access_map[cache_path] = now
                 heappush(self.access_log, (now, cache_path, bytes_written))
+
             return bytes(result)
-        except Exception as e:
+
+        except Exception:
             if os.path.exists(temp_path):
                 await trio.to_thread.run_sync(os.remove, temp_path)
-            raise e
+            raise
 
     async def evict(self, required_space: int):
         """

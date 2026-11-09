@@ -244,7 +244,27 @@ class UnityCatalogClient:
             raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 400:
-            raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
+            print("\n===== 400 RESPONSE =====")
+            print(resp.text)
+            print("========================\n")
+
+            raise UcBadRequest(
+                msg,
+                status_code=400,
+                uc_path=uc_path,
+                url=url,
+                request_id=request_id,
+            )
+							
+											   
+
+							   
+					
+								
+								
+						
+									  
+			 
 
         if resp.status_code == 412:
             # Precondition failed: the file changed under an If-Unmodified-Since
@@ -858,6 +878,17 @@ class UnityCatalogClient:
         )
         try:
             if resp.status == 206 or (resp.status == 200 and accept_200):
+                # Read the requested range into memory in a single operation.
+                # Unlike the Files API backend, which streams data in 64 KiB pieces through
+                # httpx, fuse4dbricks already operates on fixed-size chunks (typically 8 MiB)
+                # at the DataManager layer. Returning the whole range avoids hundreds of
+                # small async iterations per chunk and reduces Python scheduling overhead.
+                # Memory usage remains bounded by:
+                #     num_download_workers * chunk_size
+                #
+                # For example, with 10 workers and 8 MiB chunks, at most roughly 80 MiB of
+                # chunk payload can be simultaneously buffered by active downloads.
+
                 return resp.status, resp.read(length)
             return resp.status, b""
         finally:
@@ -876,6 +907,18 @@ class UnityCatalogClient:
         if_unmodified_since: float | None,
     ) -> bytes | None:
         """Read [offset, offset + length) directly from storage.
+										  
+											  
+							
+				  
+						 
+			  
+		 
+		
+											  
+									 
+		
+								   
 
         Returns None when the caller should use the Files API instead. Nothing
         logged or raised here includes the presigned URL.
@@ -959,8 +1002,14 @@ class UnityCatalogClient:
         directly from cloud storage through a presigned URL.
 
         Falls back to ``download_chunk_stream`` (GET /api/2.0/fs/files) when no
-        URL can be created or storage does not serve the range. Yields the
-        range as a single piece.
+        URL can be created or storage does not serve the range.
+        Yields the requested range as a single chunk.
+        
+        Unlike download_chunk_stream(), which forwards the Files API stream in
+        64 KiB pieces, the presigned path reads the whole requested Fuse chunk
+        (typically 8 MiB) into memory and yields it once. This matches the
+        DataManager's chunk-oriented design and reduces Python and async
+        overhead during large sequential reads.
         """
         logger.debug(f"uc_client.download_chunk_stream_presigned for {path}")
         data = await self._download_range_presigned(

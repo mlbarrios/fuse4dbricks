@@ -1,11 +1,16 @@
-# Unreleased
+# 0.7.10 (2026-11-06)
 
 - Add experimental `--use-presigned-downloads` (off by default). File data is
-  read directly from cloud storage through presigned URLs from
-  `POST /api/2.0/fs/create-download-url`, as the Databricks SDK does, instead
-  of being proxied through `GET /api/2.0/fs/files`. URLs are cached per
-  (uid, path), refreshed before expiry and after a 403, and never logged. Any
-  failure falls back to the Files API.
+  read directly from cloud storage through presigned URLs obtained from
+  `POST /api/2.0/fs/create-download-url`, matching the mechanism currently used
+  by the Databricks SDK file client, instead of being proxied through
+  `GET /api/2.0/fs/files`. The existing chunked read architecture is preserved:
+  reads continue to use range requests, prefetching, scheduler workers, RAM
+  cache and disk cache exactly as before. URLs are cached per `(uid, path)`,
+  refreshed before expiry and after a 403 response, and never logged. Any
+  failure automatically falls back to the Files API. This option is
+  experimental because it depends on a Databricks endpoint that is not part of
+  the publicly documented Files API.
 
 # 0.7.9 (2026-10-31)
 

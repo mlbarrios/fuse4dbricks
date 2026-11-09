@@ -20,14 +20,19 @@ the sizes of those caches are available.
 
 **Experimental: presigned downloads.** By default, file data is read through the Files API
 (`GET /api/2.0/fs/files`), which proxies every byte through the Databricks workspace. With
-`--use-presigned-downloads`, fuse4dbricks instead asks for a short-lived presigned URL
-(`POST /api/2.0/fs/create-download-url`, the mechanism the Databricks SDK uses for
-`files.download()`) and reads byte ranges directly from cloud storage, which can be
-substantially faster. URLs are cached per user and file for up to 15 minutes, so revoking a
-user's access may take that long to stop reads already in progress. If a presigned URL cannot
-be created, or storage refuses a request, the read falls back to the Files API automatically.
-This requires the client machine to reach the storage account directly (no firewall or
-private-endpoint restriction blocking it).
+`--use-presigned-downloads`, fuse4dbricks instead obtains a short-lived presigned URL via
+`POST /api/2.0/fs/create-download-url` (the mechanism currently used internally by the
+Databricks SDK file client) and reads byte ranges directly from cloud storage. The existing
+read architecture is unchanged: range requests, scheduler workers, prefetching, RAM cache and
+disk cache continue to operate exactly as before, with only the data source changing. This can
+significantly improve throughput because file contents no longer traverse the Databricks Files
+API service. URLs are cached per user and file for up to 15 minutes and refreshed before
+expiry. Since access is validated when the URL is created, revoking a user's Unity Catalog
+permissions may take up to the remaining URL lifetime to stop reads already in progress. If a
+presigned URL cannot be created, or storage refuses a request, the read automatically falls
+back to the Files API. This feature is experimental because `create-download-url` is not
+currently part of the publicly documented Files API. Direct connectivity from the client
+machine to the underlying storage account is required.
 
 **Credentials** are stored in RAM while the filesystem is mounted.
 
