@@ -606,4 +606,3 @@ async def test_missing_chunk_can_be_stored_again(persistence):
     await persistence.store_chunk_from_stream("f", 0, 0.0, async_byte_generator(b"new"))
     assert persistence.has_chunk("f", 0, 0.0)
     assert await persistence.retrieve_chunk("f", 0, 0.0) == b"new"
-    assert await persistence.retrieve_chunk("f", 0, 0.0) == b"new"
