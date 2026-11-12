@@ -27,7 +27,6 @@ dependencies = [
     "pyfuse3>=3.4.2",
     "trio>=0.22.0",
     "httpx>=0.24.0",
-    "urllib3>=2",
     "databricks-sdk>=0.20.0",
 ]
 

@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-import urllib3
 
 import pyfuse3
 
@@ -625,7 +624,7 @@ async def test_presigned_download_reads_range_from_storage_and_caches_url(client
 
     client.get_download_url.assert_awaited_once()  # second chunk reuses the cached URL
     assert fallback_calls == []
-    _pool, url, headers, length, accept_200 = client._storage_get_blocking.call_args[0]
+    _storage_client, url, headers, length, accept_200 = client._storage_get_blocking.call_args[0]
     assert url == _SECRET_URL
     assert headers["Range"] == "bytes=8388608-8388707"
     assert headers["If-Unmodified-Since"] == "Sun, 01 Feb 2026 12:00:00 GMT"
@@ -743,7 +742,7 @@ async def test_presigned_retries_transient_errors_and_short_reads(client, backof
     client._storage_get_blocking = MagicMock(
         side_effect=[
             (503, b""),
-            urllib3.exceptions.ReadTimeoutError(None, _SECRET_URL, "read timed out"),
+            httpx.ReadTimeout("read timed out"),
             (206, b"x" * 5),  # short read
             (206, b"x" * 10),
         ]
@@ -773,49 +772,44 @@ async def test_presigned_200_only_accepted_at_offset_zero(client):
     assert len(fallback_calls) == 1
 
 
-def _storage_response(status, body=b"", closed=True):
-    resp = MagicMock()
-    resp.status = status
-    resp.read.return_value = body
-    resp.closed = closed
+def _storage_response(status_code, body=b""):
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.content = body
     return resp
 
 
-def test_storage_get_blocking_reads_exactly_the_range():
-    pool = MagicMock()
-    pool.request.return_value = _storage_response(206, b"x" * 10)
+def test_storage_get_blocking_uses_httpx_client():
+    client = MagicMock()
+    client.get.return_value = _storage_response(206, b"x" * 10)
 
     status, body = UnityCatalogClient._storage_get_blocking(
-        pool, _SECRET_URL, {"Range": "bytes=0-9"}, 10, False
+        client,
+        _SECRET_URL,
+        {"Range": "bytes=0-9"},
+        10,
+        False,
     )
 
     assert (status, body) == (206, b"x" * 10)
-    pool.request.return_value.read.assert_called_once_with(10)
-    kwargs = pool.request.call_args[1]
-    assert kwargs["preload_content"] is False
-    assert kwargs["redirect"] is False
-    pool.request.return_value.close.assert_not_called()  # connection returned to the pool
+
+    client.get.assert_called_once_with(
+        _SECRET_URL,
+        headers={"Range": "bytes=0-9"},
+        follow_redirects=False,
+    )
 
 
-def test_storage_get_blocking_drops_unread_error_response():
-    pool = MagicMock()
-    pool.request.return_value = _storage_response(403, closed=False)
+def test_storage_get_blocking_error_response():
+    client = MagicMock()
+    client.get.return_value = _storage_response(403)
 
     status, body = UnityCatalogClient._storage_get_blocking(
-        pool, _SECRET_URL, {"Range": "bytes=10-19"}, 10, False
+        client,
+        _SECRET_URL,
+        {"Range": "bytes=10-19"},
+        10,
+        False,
     )
 
     assert (status, body) == (403, b"")
-    pool.request.return_value.read.assert_not_called()
-    pool.request.return_value.close.assert_called_once()
-
-
-def test_storage_pool_suppresses_urllib3_debug_request_lines(client):
-    pool_logger = logging.getLogger("urllib3.connectionpool")
-    previous = pool_logger.level
-    pool_logger.setLevel(logging.DEBUG)
-    try:
-        client._get_storage_pool()
-        assert pool_logger.level == logging.INFO
-    finally:
-        pool_logger.setLevel(previous)

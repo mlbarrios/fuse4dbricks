@@ -17,7 +17,6 @@ from typing import AsyncGenerator
 import httpx
 import pyfuse3
 import trio
-import urllib3
 
 from fuse4dbricks.api.errors import (
     UcBadRequest,
@@ -171,13 +170,14 @@ class UnityCatalogClient:
         self._download_url_inflight: dict[tuple[int, str], trio.Event] = {}
         self._presigned_failures: dict[tuple[int, str], float] = {}
         "(uid, uc_path) -> monotonic time until which the Files API is used directly"
-        self._storage_pool: urllib3.PoolManager | None = None
+        self._storage_client: httpx.Client | None = None
         self._storage_limiter = trio.CapacityLimiter(_PRESIGNED_DOWNLOAD_CONCURRENCY)
 
     async def close(self):
         await self.client.aclose()
-        if self._storage_pool is not None:
-            self._storage_pool.clear()
+        
+        if self._storage_client is not None:
+            self._storage_client.close()
 
     async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
         """
@@ -244,27 +244,7 @@ class UnityCatalogClient:
             raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 400:
-            print("\n===== 400 RESPONSE =====")
-            print(resp.text)
-            print("========================\n")
-
-            raise UcBadRequest(
-                msg,
-                status_code=400,
-                uc_path=uc_path,
-                url=url,
-                request_id=request_id,
-            )
-							
-											   
-
-							   
-					
-								
-								
-						
-									  
-			 
+            raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 412:
             # Precondition failed: the file changed under an If-Unmodified-Since
@@ -848,24 +828,31 @@ class UnityCatalogClient:
             key[1], reason, _PRESIGNED_FAILURE_TTL_S,
         )
 
-    def _get_storage_pool(self) -> urllib3.PoolManager:
-        if self._storage_pool is None:
-            # urllib3 logs each request line, query string included, at DEBUG.
-            # The query string of a presigned URL is its signature: keep it out
-            # of --debug logs.
-            pool_logger = logging.getLogger("urllib3.connectionpool")
-            if pool_logger.level < logging.INFO:
-                pool_logger.setLevel(logging.INFO)
-            self._storage_pool = urllib3.PoolManager(
-                maxsize=_PRESIGNED_DOWNLOAD_CONCURRENCY,
-                retries=False,
-                timeout=urllib3.Timeout(connect=10.0, read=60.0),
+    def _get_storage_client(self) -> httpx.Client:
+        if self._storage_client is None:
+            self._storage_client = httpx.Client(
+                follow_redirects=False,
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=60.0,
+                    write=10.0,
+                    pool=30.0,
+                ),
+                limits=httpx.Limits(
+                    max_keepalive_connections=_PRESIGNED_DOWNLOAD_CONCURRENCY,
+                    max_connections=_PRESIGNED_DOWNLOAD_CONCURRENCY,
+                ),
             )
-        return self._storage_pool
+
+        return self._storage_client
 
     @staticmethod
     def _storage_get_blocking(
-        pool: urllib3.PoolManager, url: str, headers: dict[str, str], length: int, accept_200: bool
+        client: httpx.Client,
+        url: str,
+        headers: dict[str, str],
+        length: int,
+        accept_200: bool,
     ) -> tuple[int, bytes]:
         """Blocking ranged GET against cloud storage; runs in a worker thread.
 
@@ -873,29 +860,32 @@ class UnityCatalogClient:
         loop, which also serves FUSE. Returns (status, body); the body is empty
         unless the range was served, and is never longer than ``length``.
         """
-        resp = pool.request(
-            "GET", url, headers=headers, preload_content=False, decode_content=False, redirect=False
+        resp = client.get(
+            url,
+            headers=headers,
+            follow_redirects=False,
         )
-        try:
-            if resp.status == 206 or (resp.status == 200 and accept_200):
-                # Read the requested range into memory in a single operation.
-                # Unlike the Files API backend, which streams data in 64 KiB pieces through
-                # httpx, fuse4dbricks already operates on fixed-size chunks (typically 8 MiB)
-                # at the DataManager layer. Returning the whole range avoids hundreds of
-                # small async iterations per chunk and reduces Python scheduling overhead.
-                # Memory usage remains bounded by:
-                #     num_download_workers * chunk_size
-                #
-                # For example, with 10 workers and 8 MiB chunks, at most roughly 80 MiB of
-                # chunk payload can be simultaneously buffered by active downloads.
 
-                return resp.status, resp.read(length)
-            return resp.status, b""
-        finally:
-            # A fully read range has already returned its connection to the pool;
-            # anything unread (error bodies, a whole blob sent with 200) is dropped.
-            if not resp.closed:
-                resp.close()
+        if resp.status_code == 206 or (
+            resp.status_code == 200 and accept_200
+        ):
+            # Read the requested range into memory in a single operation.
+            # Unlike the Files API backend, which streams data in 64 KiB pieces through
+            # httpx, fuse4dbricks already operates on fixed-size chunks (typically 8 MiB)
+            # at the DataManager layer. Returning the whole range avoids hundreds of
+            # small async iterations per chunk and reduces Python scheduling overhead.
+            # Memory usage remains bounded by:
+            #     num_download_workers * chunk_size
+            #
+            # For example, with 10 workers and 8 MiB chunks, at most roughly 80 MiB of
+            # chunk payload can be simultaneously buffered by active downloads.
+            #
+            # httpx.Client manages connection pooling internally. Because get()
+            # reads the response body eagerly, the connection is available for reuse
+            # by subsequent requests once this call returns.
+            return resp.status_code, resp.content[:length]
+
+        return resp.status_code, b""
 
     async def _download_range_presigned(
         self,
@@ -906,20 +896,8 @@ class UnityCatalogClient:
         ctx: pyfuse3.RequestContext,
         if_unmodified_since: float | None,
     ) -> bytes | None:
-        """Read [offset, offset + length) directly from storage.
-										  
-											  
-							
-				  
-						 
-			  
-		 
-		
-											  
-									 
-		
-								   
-
+        """
+        Read [offset, offset + length) directly from storage.
         Returns None when the caller should use the Files API instead. Nothing
         logged or raised here includes the presigned URL.
         """
@@ -930,7 +908,7 @@ class UnityCatalogClient:
         range_headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
         if if_unmodified_since:
             range_headers["If-Unmodified-Since"] = formatdate(if_unmodified_since, usegmt=True)
-        pool = self._get_storage_pool()
+        client = self._get_storage_client()
 
         refreshed = False
         attempt = 0
@@ -946,7 +924,7 @@ class UnityCatalogClient:
             try:
                 status, body = await trio.to_thread.run_sync(
                     self._storage_get_blocking,
-                    pool,
+                    client,
                     presigned.url,
                     {**presigned.headers, **range_headers},
                     length,
@@ -954,7 +932,7 @@ class UnityCatalogClient:
                     limiter=self._storage_limiter,
                 )
                 failure = f"storage status {status}"
-            except urllib3.exceptions.HTTPError as exc:
+            except httpx.HTTPError as exc:
                 # Message deliberately not logged: it may contain the URL.
                 status, body = None, b""
                 failure = f"storage transport error {type(exc).__name__}"
