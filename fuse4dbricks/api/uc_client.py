@@ -175,7 +175,6 @@ class UnityCatalogClient:
 
     async def close(self):
         await self.client.aclose()
-        
         if self._storage_client is not None:
             self._storage_client.close()
 
@@ -244,7 +243,23 @@ class UnityCatalogClient:
             raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 400:
-            raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
+            raise UcBadRequest(
+                msg,
+                status_code=400,
+                uc_path=uc_path,
+                url=url,
+                request_id=request_id,
+            )
+							
+											   
+
+							   
+					
+								
+								
+						
+									  
+			 
 
         if resp.status_code == 412:
             # Precondition failed: the file changed under an If-Unmodified-Since
@@ -831,16 +846,17 @@ class UnityCatalogClient:
     def _get_storage_client(self) -> httpx.Client:
         if self._storage_client is None:
             self._storage_client = httpx.Client(
+                http2=False,
                 follow_redirects=False,
                 timeout=httpx.Timeout(
                     connect=10.0,
                     read=60.0,
                     write=10.0,
-                    pool=30.0,
+                    pool=5.0,
                 ),
                 limits=httpx.Limits(
-                    max_keepalive_connections=_PRESIGNED_DOWNLOAD_CONCURRENCY,
-                    max_connections=_PRESIGNED_DOWNLOAD_CONCURRENCY,
+                    max_keepalive_connections=20,
+                    max_connections=20,
                 ),
             )
 
@@ -851,15 +867,9 @@ class UnityCatalogClient:
         client: httpx.Client,
         url: str,
         headers: dict[str, str],
-        length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
-        """Blocking ranged GET against cloud storage; runs in a worker thread.
 
-        Blocking reads keep the per-byte work (TLS, HTTP framing) off the Trio
-        loop, which also serves FUSE. Returns (status, body); the body is empty
-        unless the range was served, and is never longer than ``length``.
-        """
         resp = client.get(
             url,
             headers=headers,
@@ -869,21 +879,7 @@ class UnityCatalogClient:
         if resp.status_code == 206 or (
             resp.status_code == 200 and accept_200
         ):
-            # Read the requested range into memory in a single operation.
-            # Unlike the Files API backend, which streams data in 64 KiB pieces through
-            # httpx, fuse4dbricks already operates on fixed-size chunks (typically 8 MiB)
-            # at the DataManager layer. Returning the whole range avoids hundreds of
-            # small async iterations per chunk and reduces Python scheduling overhead.
-            # Memory usage remains bounded by:
-            #     num_download_workers * chunk_size
-            #
-            # For example, with 10 workers and 8 MiB chunks, at most roughly 80 MiB of
-            # chunk payload can be simultaneously buffered by active downloads.
-            #
-            # httpx.Client manages connection pooling internally. Because get()
-            # reads the response body eagerly, the connection is available for reuse
-            # by subsequent requests once this call returns.
-            return resp.status_code, resp.content[:length]
+            return resp.status_code, resp.content
 
         return resp.status_code, b""
 
@@ -896,8 +892,7 @@ class UnityCatalogClient:
         ctx: pyfuse3.RequestContext,
         if_unmodified_since: float | None,
     ) -> bytes | None:
-        """
-        Read [offset, offset + length) directly from storage.
+        """Read [offset, offset + length) directly from storage.
         Returns None when the caller should use the Files API instead. Nothing
         logged or raised here includes the presigned URL.
         """
@@ -922,12 +917,14 @@ class UnityCatalogClient:
                 return None
 
             try:
+                headers = presigned.headers.copy()
+                headers.update(range_headers)
+
                 status, body = await trio.to_thread.run_sync(
                     self._storage_get_blocking,
                     client,
                     presigned.url,
-                    {**presigned.headers, **range_headers},
-                    length,
+                    headers,
                     offset == 0,
                     limiter=self._storage_limiter,
                 )

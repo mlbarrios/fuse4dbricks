@@ -624,13 +624,13 @@ async def test_presigned_download_reads_range_from_storage_and_caches_url(client
 
     client.get_download_url.assert_awaited_once()  # second chunk reuses the cached URL
     assert fallback_calls == []
-    _storage_client, url, headers, length, accept_200 = client._storage_get_blocking.call_args[0]
+    _storage_client, url, headers, accept_200 = client._storage_get_blocking.call_args[0]
     assert url == _SECRET_URL
     assert headers["Range"] == "bytes=8388608-8388707"
     assert headers["If-Unmodified-Since"] == "Sun, 01 Feb 2026 12:00:00 GMT"
     assert headers["x-ms-version"] == "2021-04-10"
     assert "Authorization" not in headers  # the signature is the credential
-    assert (length, accept_200) == (100, False)
+    assert accept_200 is False
 
 
 @pytest.mark.trio
@@ -787,7 +787,6 @@ def test_storage_get_blocking_uses_httpx_client():
         client,
         _SECRET_URL,
         {"Range": "bytes=0-9"},
-        10,
         False,
     )
 
@@ -808,7 +807,6 @@ def test_storage_get_blocking_error_response():
         client,
         _SECRET_URL,
         {"Range": "bytes=10-19"},
-        10,
         False,
     )
 
