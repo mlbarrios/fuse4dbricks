@@ -855,8 +855,8 @@ class UnityCatalogClient:
                     pool=5.0,
                 ),
                 limits=httpx.Limits(
-                    max_keepalive_connections=20,
-                    max_connections=20,
+                    max_keepalive_connections=50,
+                    max_connections=50,
                 ),
             )
 
@@ -867,21 +867,65 @@ class UnityCatalogClient:
         client: httpx.Client,
         url: str,
         headers: dict[str, str],
+        length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
 
-        resp = client.get(
+        start = time.perf_counter()
+
+        with client.stream(
+            "GET",
             url,
             headers=headers,
             follow_redirects=False,
-        )
+        ) as resp:
 
-        if resp.status_code == 206 or (
-            resp.status_code == 200 and accept_200
-        ):
-            return resp.status_code, resp.content
+            status = resp.status_code
+            
+            # bottleneck revision
+            logger.info(
+                "HTTPX_PROTOCOL version=%s status=%s",
+                resp.http_version,
+                resp.status_code,
+            )
 
-        return resp.status_code, b""
+            if status == 206 or (status == 200 and accept_200):
+
+                body = resp.read()
+                
+                # blottleneck
+                #if len(body) > length:
+                #    body = body[:length]
+
+                elapsed = time.perf_counter() - start
+                # bottleneck: calculate throughput in MB/s
+                throughput_mb_s = (
+                    len(body) / 1024 / 1024 / elapsed
+                    if elapsed > 0
+                    else 0
+                )
+
+                logger.info(
+                    "HTTPX_DOWNLOAD "
+                    "status=%s bytes=%s expected=%s took=%.3fs throughput=%.1fMB/s",
+                    status,
+                    len(body),
+                    length,
+                    elapsed,
+                    throughput_mb_s,
+                )
+
+                return status, body
+
+            elapsed = time.perf_counter() - start
+
+            logger.info(
+                "HTTPX_DOWNLOAD_ERROR status=%s took=%.3fs",
+                status,
+                elapsed,
+            )
+
+            return status, b""
 
     async def _download_range_presigned(
         self,
@@ -925,9 +969,21 @@ class UnityCatalogClient:
                     client,
                     presigned.url,
                     headers,
+                    length,
                     offset == 0,
                     limiter=self._storage_limiter,
                 )
+                
+                # bottleneck validation
+                logger.info(
+                    "PRESIGNED_RANGE "
+                    "offset=%s length=%s returned=%s status=%s",
+                    offset,
+                    length,
+                    len(body),
+                    status,
+                )
+                
                 failure = f"storage status {status}"
             except httpx.HTTPError as exc:
                 # Message deliberately not logged: it may contain the URL.
@@ -936,6 +992,15 @@ class UnityCatalogClient:
 
             if status == 206 or (status == 200 and offset == 0):
                 if len(body) == length:
+
+                    logger.info(
+                        "DOWNLOAD_OK "
+                        "offset=%s expected=%s returned=%s",
+                        offset,
+                        length,
+                        len(body),
+                    )
+
                     return body
                 failure = f"short read ({len(body)} of {length} bytes)"
                 status = None  # retried like a transport error

@@ -624,12 +624,13 @@ async def test_presigned_download_reads_range_from_storage_and_caches_url(client
 
     client.get_download_url.assert_awaited_once()  # second chunk reuses the cached URL
     assert fallback_calls == []
-    _storage_client, url, headers, accept_200 = client._storage_get_blocking.call_args[0]
+    _storage_client, url, headers, length, accept_200 = client._storage_get_blocking.call_args[0]
     assert url == _SECRET_URL
     assert headers["Range"] == "bytes=8388608-8388707"
     assert headers["If-Unmodified-Since"] == "Sun, 01 Feb 2026 12:00:00 GMT"
     assert headers["x-ms-version"] == "2021-04-10"
     assert "Authorization" not in headers  # the signature is the credential
+    assert length == 100
     assert accept_200 is False
 
 
@@ -781,18 +782,30 @@ def _storage_response(status_code, body=b""):
 
 def test_storage_get_blocking_uses_httpx_client():
     client = MagicMock()
-    client.get.return_value = _storage_response(206, b"x" * 10)
+
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 206
+    resp.http_version = "HTTP/1.1"
+    resp.read.return_value = b"x" * 10
+
+    stream_cm = MagicMock()
+    stream_cm.__enter__.return_value = resp
+    stream_cm.__exit__.return_value = False
+
+    client.stream.return_value = stream_cm
 
     status, body = UnityCatalogClient._storage_get_blocking(
         client,
         _SECRET_URL,
         {"Range": "bytes=0-9"},
+        10,
         False,
     )
 
     assert (status, body) == (206, b"x" * 10)
 
-    client.get.assert_called_once_with(
+    client.stream.assert_called_once_with(
+        "GET",
         _SECRET_URL,
         headers={"Range": "bytes=0-9"},
         follow_redirects=False,
@@ -801,13 +814,30 @@ def test_storage_get_blocking_uses_httpx_client():
 
 def test_storage_get_blocking_error_response():
     client = MagicMock()
-    client.get.return_value = _storage_response(403)
+
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 403
+    resp.http_version = "HTTP/1.1"
+
+    stream_cm = MagicMock()
+    stream_cm.__enter__.return_value = resp
+    stream_cm.__exit__.return_value = False
+
+    client.stream.return_value = stream_cm
 
     status, body = UnityCatalogClient._storage_get_blocking(
         client,
         _SECRET_URL,
         {"Range": "bytes=10-19"},
+        10,
         False,
     )
 
     assert (status, body) == (403, b"")
+
+    client.stream.assert_called_once_with(
+        "GET",
+        _SECRET_URL,
+        headers={"Range": "bytes=10-19"},
+        follow_redirects=False,
+    )
