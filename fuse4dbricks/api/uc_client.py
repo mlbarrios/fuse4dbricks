@@ -880,145 +880,96 @@ class UnityCatalogClient:
         accept_200: bool,
     ) -> tuple[int, bytes]:
 
-        USE_URLLIB3_BENCH = False
-
-        if USE_URLLIB3_BENCH:
-
-            http = urllib3.PoolManager()
-
-            t0 = time.perf_counter()
-            cpu0 = time.thread_time()
-
-            resp = http.request(
-                "GET",
-                url,
-                headers=headers,
-                preload_content=False,
-            )
-
-            body = resp.read()
-            resp.release_conn()
-
-            t1 = time.perf_counter()
-            cpu1 = time.thread_time()
-
-            logger.info(
-                "URLLIB3_HEADERS "
-                "content_length=%s",
-                resp.headers.get("content-length"),
-            )
-
-            logger.info(
-                "URLLIB3_BENCH "
-                "status=%s "
-                "expected=%s "
-                "returned=%s "
-                "wall=%.3fs "
-                "cpu=%.3fs "
-                "wait=%.3fs "
-                "throughput=%.1fMB/s",
-                resp.status,
-                length,
-                len(body),
-                t1 - t0,
-                cpu1 - cpu0,
-                (t1 - t0) - (cpu1 - cpu0),
-                len(body) / 1024 / 1024 / (t1 - t0),
-            )
-
-            return resp.status, body
-        
         t0 = time.perf_counter()
 
-        with client.stream(
-            "GET",
+        resp = client.get(
             url,
             headers=headers,
             follow_redirects=False,
-        ) as resp:
+        )
 
-            t1 = time.perf_counter()
+        t1 = time.perf_counter()
 
-            status = resp.status_code
+        status = resp.status_code
+
+        logger.info(
+            "HTTPX_PROTOCOL version=%s status=%s",
+            resp.http_version,
+            resp.status_code,
+        )
+
+        logger.info(
+            "HTTPX_HEADERS content_length=%s",
+            resp.headers.get("content-length"),
+        )
+
+        if status == 206 or (status == 200 and accept_200):
+
+            read_start = time.perf_counter()
+            cpu_start = time.thread_time()
+
+            body = resp.content
+
+            read_end = time.perf_counter()
+            cpu_end = time.thread_time()
 
             logger.info(
-                "HTTPX_PROTOCOL version=%s status=%s",
-                resp.http_version,
-                resp.status_code,
+                "HTTPX_BREAKDOWN "
+                "wall=%.3fs "
+                "cpu=%.3fs "
+                "wait=%.3fs",
+                read_end - read_start,
+                cpu_end - cpu_start,
+                (read_end - read_start) - (cpu_end - cpu_start),
             )
 
             logger.info(
-                "HTTPX_HEADERS content_length=%s",
-                resp.headers.get("content-length"),
+                "HTTPX_CONTENT bytes=%s took=%.6fs",
+                len(body),
+                read_end - read_start,
             )
 
-            if status == 206 or (status == 200 and accept_200):
+            logger.info(
+                "HTTPX_TIMING "
+                "setup=%.3fs "
+                "read=%.3fs "
+                "total=%.3fs",
+                t1 - t0,
+                read_end - read_start,
+                read_end - t0,
+            )
 
-                read_start = time.perf_counter()
-                cpu_start = time.thread_time()
-
-                body = b"".join(resp.iter_raw())
-
-                iter_end = time.perf_counter()
-                cpu_after_iter = time.thread_time()
-
-                join_end = iter_end
-
-                logger.info(
-                    "HTTPX_BREAKDOWN "
-                    "iter_wall=%.3fs "
-                    "iter_cpu=%.3fs "
-                    "wait=%.3fs",
-                    iter_end - read_start,
-                    cpu_after_iter - cpu_start,
-                    (iter_end - read_start) - (cpu_after_iter - cpu_start),
-)
-
-                read_end = join_end
-                
-                logger.info(
-                    "HTTPX_ITER bytes=%s took=%.3fs",
-                    len(body),
-                    read_end - read_start,
-                )
-
-                logger.info(
-                    "HTTPX_TIMING "
-                    "setup=%.3fs "
-                    "read=%.3fs "
-                    "total=%.3fs",
-                    t1 - t0,
-                    read_end - read_start,
-                    read_end - t0,
-                )
-
-                throughput_mb_s = (
-                    len(body) / 1024 / 1024 / (read_end - t0)
-                    if (read_end - t0) > 0
-                    else 0
-                )
-
-                logger.info(
-                    "HTTPX_DOWNLOAD "
-                    "status=%s bytes=%s expected=%s took=%.3fs throughput=%.1fMB/s",
-                    status,
-                    len(body),
-                    length,
-                    read_end - t0,
-                    throughput_mb_s,
-                )
-
-                return status, body
-
-            elapsed = time.perf_counter() - t0
+            throughput_mb_s = (
+                len(body) / 1024 / 1024 / (read_end - t0)
+                if (read_end - t0) > 0
+                else 0
+            )
 
             logger.info(
-                "HTTPX_DOWNLOAD_ERROR status=%s took=%.3fs",
+                "HTTPX_DOWNLOAD "
+                "status=%s "
+                "bytes=%s "
+                "expected=%s "
+                "took=%.3fs "
+                "throughput=%.1fMB/s",
                 status,
-                elapsed,
+                len(body),
+                length,
+                read_end - t0,
+                throughput_mb_s,
             )
 
-            return status, b""
+            return status, body
+
+        elapsed = time.perf_counter() - t0
+
+        logger.info(
+            "HTTPX_DOWNLOAD_ERROR status=%s took=%.3fs",
+            status,
+            elapsed,
+        )
+
+        return status, b""
 
     async def _download_range_presigned(
         self,
