@@ -883,6 +883,11 @@ class UnityCatalogClient:
     ) -> tuple[int, bytes]:
         
         logger.info(
+            "HTTPX_CLIENT id=%s",
+            id(client),
+        )
+        
+        logger.info(
             "HTTPX_WORKER_ENTER "
             "thread=%s",
             threading.get_ident(),
