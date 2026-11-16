@@ -180,14 +180,13 @@ class UnityCatalogClient:
         self._download_url_inflight: dict[tuple[int, str], trio.Event] = {}
         self._presigned_failures: dict[tuple[int, str], float] = {}
         "(uid, uc_path) -> monotonic time until which the Files API is used directly"
-        #self._storage_client: httpx.Client | None = None
-        self._storage_client: httpx.AsyncClient | None = None
+        self._storage_client: httpx.Client | None = None
         self._storage_limiter = trio.CapacityLimiter(_PRESIGNED_DOWNLOAD_CONCURRENCY)
 
     async def close(self):
         await self.client.aclose()
         if self._storage_client is not None:
-            await self._storage_client.aclose()
+            self._storage_client.close()
 
     async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
         """
@@ -261,14 +260,6 @@ class UnityCatalogClient:
                 url=url,
                 request_id=request_id,
             )
-							
-											   
-
-							   
-					
-								
-								
-						
 									  
 			 
 
@@ -854,10 +845,9 @@ class UnityCatalogClient:
             key[1], reason, _PRESIGNED_FAILURE_TTL_S,
         )
 
-    #def _get_storage_client(self) -> httpx.Client:
-    def _get_storage_client(self) -> httpx.AsyncClient:
+    def _get_storage_client(self) -> httpx.Client:
         if self._storage_client is None:
-            self._storage_client = httpx.AsyncClient(
+            self._storage_client = httpx.Client(
                 http2=False,
                 follow_redirects=False,
                 timeout=httpx.Timeout(
@@ -867,52 +857,12 @@ class UnityCatalogClient:
                     pool=30.0,
                 ),
                 limits=httpx.Limits(
-                    max_keepalive_connections=200,
-                    max_connections=200,
+                    max_keepalive_connections=50,
+                    max_connections=50,
                 ),
             )
 
         return self._storage_client
-    
-    
-    async def _storage_get_async(
-        self,
-        client: httpx.AsyncClient,
-        url: str,
-        headers: dict[str, str],
-        length: int,
-        accept_200: bool,
-    ) -> tuple[int, bytes]:
-
-        logger.info(
-            "HTTPX_ASYNC_TASK task=%s",
-            id(trio.lowlevel.current_task()),
-        )
-
-        t0 = time.perf_counter()
-
-        resp = await client.get(
-            url,
-            headers=headers,
-            follow_redirects=False,
-        )
-
-        t1 = time.perf_counter()
-
-        status = resp.status_code
-
-        body = resp.content
-
-        t2 = time.perf_counter()
-
-        logger.info(
-            "HTTPX_ASYNC_SPLIT request=%.3fs content=%.6fs total=%.3fs",
-            t1 - t0,
-            t2 - t1,
-            t2 - t0,
-        )
-
-        return status, body    
     
     
     @staticmethod
@@ -923,120 +873,33 @@ class UnityCatalogClient:
         length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
-        
-        logger.info(
-            "HTTPX_CLIENT id=%s",
-            id(client),
-        )
-        
-        logger.info(
-            "HTTPX_WORKER_ENTER "
-            "thread=%s",
-            threading.get_ident(),
-        )
+        req_headers = headers
+        if "Accept-Encoding" not in req_headers:
+            req_headers = {**headers, "Accept-Encoding": "identity"}
 
-        t0 = time.perf_counter()
+        with client.stream("GET", url, headers=req_headers, follow_redirects=False) as resp:
+            status = resp.status_code
+            if status != 206 and not (status == 200 and accept_200):
+                return status, b""
 
-        resp = client.get(
-            url,
-            headers=headers,
-            follow_redirects=False,
-        )
+            # Preasignación de memoria exacta (zero-reallocation)
+            buf = bytearray(length)
+            view = memoryview(buf)
+            pos = 0
 
-        t1 = time.perf_counter()
+            # iter_raw evita la capa de decodificación de httpx/httpcore
+            for chunk in resp.iter_raw(chunk_size=1024 * 1024):
+                n = len(chunk)
+                if pos + n > length:
+                    # Protección por si el servidor devuelve más bytes de los pedidos
+                    view[pos:length] = chunk[: length - pos]
+                    pos = length
+                    break
+                view[pos : pos + n] = chunk
+                pos += n
 
-        status = resp.status_code
+            return status, bytes(buf[:pos]) if pos < length else bytes(buf)
 
-        logger.info(
-            "HTTPX_PROTOCOL version=%s status=%s",
-            resp.http_version,
-            resp.status_code,
-        )
-
-        logger.info(
-            "HTTPX_HEADERS content_length=%s",
-            resp.headers.get("content-length"),
-        )
-
-        if status == 206 or (status == 200 and accept_200):
-
-            read_start = time.perf_counter()
-            cpu_start = time.thread_time()
-
-            body = resp.content
-            
-            t2 = time.perf_counter()
-
-            read_end = t2
-            cpu_end = time.thread_time()
-            
-            logger.info(
-                "HTTPX_SPLIT "
-                "request=%.3fs "
-                "content=%.6fs "
-                "total=%.3fs",
-                t1 - t0,
-                t2 - t1,
-                t2 - t0,
-            )
-
-            logger.info(
-                "HTTPX_BREAKDOWN "
-                "wall=%.3fs "
-                "cpu=%.3fs "
-                "wait=%.3fs",
-                read_end - read_start,
-                cpu_end - cpu_start,
-                (read_end - read_start) - (cpu_end - cpu_start),
-            )
-
-            logger.info(
-                "HTTPX_CONTENT bytes=%s took=%.6fs",
-                len(body),
-                read_end - read_start,
-            )
-
-            logger.info(
-                "HTTPX_TIMING "
-                "setup=%.3fs "
-                "read=%.3fs "
-                "total=%.3fs",
-                t1 - t0,
-                read_end - read_start,
-                read_end - t0,
-            )
-
-            throughput_mb_s = (
-                len(body) / 1024 / 1024 / (read_end - t0)
-                if (read_end - t0) > 0
-                else 0
-            )
-
-            logger.info(
-                "HTTPX_DOWNLOAD "
-                "status=%s "
-                "bytes=%s "
-                "expected=%s "
-                "took=%.3fs "
-                "throughput=%.1fMB/s",
-                status,
-                len(body),
-                length,
-                read_end - t0,
-                throughput_mb_s,
-            )
-
-            return status, body
-
-        elapsed = time.perf_counter() - t0
-
-        logger.info(
-            "HTTPX_DOWNLOAD_ERROR status=%s took=%.3fs",
-            status,
-            elapsed,
-        )
-
-        return status, b""
 
 
     @staticmethod
@@ -1175,14 +1038,15 @@ class UnityCatalogClient:
 
                 else:
 
-                    async with self._storage_limiter:
-                        status, body = await self._storage_get_async(
-                            client,
-                            presigned.url,
-                            headers,
-                            length,
-                            offset == 0,
-                        )
+                    status, body = await trio.to_thread.run_sync(
+                        self._storage_get_blocking,
+                        client,
+                        presigned.url,
+                        headers,
+                        length,
+                        offset == 0,
+                        limiter=self._storage_limiter,
+                    )
                     
                     logger.info(
                         "DOWNLOAD_DISPATCH "
