@@ -901,8 +901,17 @@ class UnityCatalogClient:
                 
                 chunks = []
                 
-                for chunk in resp.iter_bytes():
+                for chunk in resp.iter_bytes(chunk_size=8 * 1024 * 1024):
                     chunks.append(chunk)
+                
+                sizes = [len(c) for c in chunks]
+                
+                logger.info(
+                    "HTTPX_CHUNK_STATS count=%s min=%s max=%s",
+                    len(sizes),
+                    min(sizes) if sizes else 0,
+                    max(sizes) if sizes else 0,
+                )
 
                 body = b"".join(chunks)
 
