@@ -180,13 +180,14 @@ class UnityCatalogClient:
         self._download_url_inflight: dict[tuple[int, str], trio.Event] = {}
         self._presigned_failures: dict[tuple[int, str], float] = {}
         "(uid, uc_path) -> monotonic time until which the Files API is used directly"
-        self._storage_client: httpx.Client | None = None
+        #self._storage_client: httpx.Client | None = None
+        self._storage_client: httpx.AsyncClient | None = None
         self._storage_limiter = trio.CapacityLimiter(_PRESIGNED_DOWNLOAD_CONCURRENCY)
 
     async def close(self):
         await self.client.aclose()
         if self._storage_client is not None:
-            self._storage_client.close()
+            await self._storage_client.aclose()
 
     async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
         """
@@ -853,9 +854,10 @@ class UnityCatalogClient:
             key[1], reason, _PRESIGNED_FAILURE_TTL_S,
         )
 
-    def _get_storage_client(self) -> httpx.Client:
+    #def _get_storage_client(self) -> httpx.Client:
+    def _get_storage_client(self) -> httpx.AsyncClient:
         if self._storage_client is None:
-            self._storage_client = httpx.Client(
+            self._storage_client = httpx.AsyncClient(
                 http2=False,
                 follow_redirects=False,
                 timeout=httpx.Timeout(
@@ -871,6 +873,46 @@ class UnityCatalogClient:
             )
 
         return self._storage_client
+    
+    
+    async def _storage_get_async(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        length: int,
+        accept_200: bool,
+    ) -> tuple[int, bytes]:
+
+        logger.info(
+            "HTTPX_ASYNC_TASK task=%s",
+            id(trio.lowlevel.current_task()),
+        )
+
+        t0 = time.perf_counter()
+
+        resp = await client.get(
+            url,
+            headers=headers,
+            follow_redirects=False,
+        )
+
+        t1 = time.perf_counter()
+
+        status = resp.status_code
+
+        body = resp.content
+
+        t2 = time.perf_counter()
+
+        logger.info(
+            "HTTPX_ASYNC_SPLIT request=%.3fs content=%.6fs total=%.3fs",
+            t1 - t0,
+            t2 - t1,
+            t2 - t0,
+        )
+
+        return status, body    
     
     
     @staticmethod
@@ -1133,15 +1175,14 @@ class UnityCatalogClient:
 
                 else:
 
-                    status, body = await trio.to_thread.run_sync(
-                        self._storage_get_blocking,
-                        client,
-                        presigned.url,
-                        headers,
-                        length,
-                        offset == 0,
-                        limiter=self._storage_limiter,
-                    )
+                    async with self._storage_limiter:
+                        status, body = await self._storage_get_async(
+                            client,
+                            presigned.url,
+                            headers,
+                            length,
+                            offset == 0,
+                        )
                     
                     logger.info(
                         "DOWNLOAD_DISPATCH "
