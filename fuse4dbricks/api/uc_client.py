@@ -881,13 +881,55 @@ class UnityCatalogClient:
         length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
-        with client.stream("GET", url, headers=headers, follow_redirects=False) as resp:
+
+        t0 = time.perf_counter()
+        cpu0 = time.thread_time()
+
+        with client.stream(
+            "GET",
+            url,
+            headers=headers,
+            follow_redirects=False,
+        ) as resp:
+
+            t1 = time.perf_counter()
+
             status = resp.status_code
+
             if status != 206 and not (status == 200 and accept_200):
                 return status, b""
 
-            # iter_raw() sin chunk_size desactiva ByteChunker; b"".join lo ensambla en C en una sola pasada
-            return status, b"".join(resp.iter_raw())
+            body = resp.read()
+
+            t2 = time.perf_counter()
+
+        cpu1 = time.thread_time()
+
+        throughput_mb_s = (
+            len(body) / 1024 / 1024 / (t2 - t0)
+            if (t2 - t0) > 0
+            else 0
+        )
+
+        logger.info(
+            "HTTPX_STREAM_DOWNLOAD "
+            "status=%s "
+            "bytes=%s "
+            "request=%.3fs "
+            "content=%.3fs "
+            "total=%.3fs "
+            "cpu=%.3fs "
+            "throughput=%.1fMB/s",
+            status,
+            len(body),
+            t1 - t0,
+            t2 - t1,
+            t2 - t0,
+            cpu1 - cpu0,
+            throughput_mb_s,
+        )
+
+        return status, body
 
 
     @staticmethod
@@ -917,12 +959,15 @@ class UnityCatalogClient:
         )
 
         t1 = time.perf_counter()
+        cpu0 = time.thread_time()
 
         status = resp.status
 
         body = resp.read()
 
         t2 = time.perf_counter()
+        
+        cpu1 = time.thread_time()
 
         throughput_mb_s = (
             len(body) / 1024 / 1024 / (t2 - t0)
@@ -938,6 +983,7 @@ class UnityCatalogClient:
             "request=%.3fs "
             "content=%.6fs "
             "total=%.3fs "
+            "cpu=%.3fs "
             "throughput=%.1fMB/s",
             status,
             len(body),
@@ -945,6 +991,7 @@ class UnityCatalogClient:
             t1 - t0,
             t2 - t1,
             t2 - t0,
+            cpu1 - cpu0,
             throughput_mb_s,
         )
 
