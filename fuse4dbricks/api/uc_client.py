@@ -862,7 +862,7 @@ class UnityCatalogClient:
                     connect=10.0,
                     read=60.0,
                     write=10.0,
-                    pool=5.0,
+                    pool=30.0,
                 ),
                 limits=httpx.Limits(
                     max_keepalive_connections=200,
