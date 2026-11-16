@@ -871,7 +871,7 @@ class UnityCatalogClient:
         accept_200: bool,
     ) -> tuple[int, bytes]:
 
-        start = time.perf_counter()
+        t0 = time.perf_counter()
 
         with client.stream(
             "GET",
@@ -880,28 +880,42 @@ class UnityCatalogClient:
             follow_redirects=False,
         ) as resp:
 
+            t1 = time.perf_counter()
+
             status = resp.status_code
-            
-            # bottleneck revision
+
             logger.info(
                 "HTTPX_PROTOCOL version=%s status=%s",
                 resp.http_version,
                 resp.status_code,
             )
 
+            logger.info(
+                "HTTPX_HEADERS content_length=%s",
+                resp.headers.get("content-length"),
+            )
+
             if status == 206 or (status == 200 and accept_200):
 
-                body = resp.read()
-                
-                # blottleneck
-                #if len(body) > length:
-                #    body = body[:length]
+                read_start = time.perf_counter()
 
-                elapsed = time.perf_counter() - start
-                # bottleneck: calculate throughput in MB/s
+                body = resp.read()
+
+                read_end = time.perf_counter()
+
+                logger.info(
+                    "HTTPX_TIMING "
+                    "setup=%.3fs "
+                    "read=%.3fs "
+                    "total=%.3fs",
+                    t1 - t0,
+                    read_end - read_start,
+                    read_end - t0,
+                )
+
                 throughput_mb_s = (
-                    len(body) / 1024 / 1024 / elapsed
-                    if elapsed > 0
+                    len(body) / 1024 / 1024 / (read_end - t0)
+                    if (read_end - t0) > 0
                     else 0
                 )
 
@@ -911,13 +925,13 @@ class UnityCatalogClient:
                     status,
                     len(body),
                     length,
-                    elapsed,
+                    read_end - t0,
                     throughput_mb_s,
                 )
 
                 return status, body
 
-            elapsed = time.perf_counter() - start
+            elapsed = time.perf_counter() - t0
 
             logger.info(
                 "HTTPX_DOWNLOAD_ERROR status=%s took=%.3fs",
