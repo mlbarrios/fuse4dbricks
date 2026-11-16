@@ -72,6 +72,7 @@ _PRESIGNED_URL_REFRESH_MARGIN_S = 60
 _PRESIGNED_FAILURE_TTL_S = 60.0
 _PRESIGNED_CACHE_MAX_ENTRIES = 4096
 _PRESIGNED_DOWNLOAD_CONCURRENCY = 50
+USE_URLLIB3_FOR_STORAGE = False
 
 
 @dataclass(frozen=True)
@@ -983,6 +984,64 @@ class UnityCatalogClient:
 
         return status, b""
 
+
+    @staticmethod
+    def _storage_get_blocking_urllib3(
+        pool: urllib3.PoolManager,
+        url: str,
+        headers: dict[str, str],
+        length: int,
+        accept_200: bool,
+    ) -> tuple[int, bytes]:
+
+        t0 = time.perf_counter()
+
+        resp = pool.request(
+            "GET",
+            url,
+            headers=headers,
+            preload_content=False,
+            redirect=False,
+        )
+
+        t1 = time.perf_counter()
+
+        status = resp.status
+
+        body = resp.read()
+
+        t2 = time.perf_counter()
+
+        throughput_mb_s = (
+            len(body) / 1024 / 1024 / (t2 - t0)
+            if (t2 - t0) > 0
+            else 0
+        )
+
+        logger.info(
+            "URLLIB3_DOWNLOAD "
+            "status=%s "
+            "bytes=%s "
+            "expected=%s "
+            "request=%.3fs "
+            "content=%.6fs "
+            "total=%.3fs "
+            "throughput=%.1fMB/s",
+            status,
+            len(body),
+            length,
+            t1 - t0,
+            t2 - t1,
+            t2 - t0,
+            throughput_mb_s,
+        )
+
+        resp.release_conn()
+
+        return status, body
+
+
+
     async def _download_range_presigned(
         self,
         path: str,
@@ -1020,15 +1079,29 @@ class UnityCatalogClient:
                 headers = presigned.headers.copy()
                 headers.update(range_headers)
 
-                status, body = await trio.to_thread.run_sync(
-                    self._storage_get_blocking,
-                    client,
-                    presigned.url,
-                    headers,
-                    length,
-                    offset == 0,
-                    limiter=self._storage_limiter,
-                )
+                if USE_URLLIB3_FOR_STORAGE:
+
+                    status, body = await trio.to_thread.run_sync(
+                        self._storage_get_blocking_urllib3,
+                        self._urllib3_pool,
+                        presigned.url,
+                        headers,
+                        length,
+                        offset == 0,
+                        limiter=self._storage_limiter,
+                    )
+
+                else:
+
+                    status, body = await trio.to_thread.run_sync(
+                        self._storage_get_blocking,
+                        client,
+                        presigned.url,
+                        headers,
+                        length,
+                        offset == 0,
+                        limiter=self._storage_limiter,
+                    )
                 
                 # bottleneck validation
                 logger.info(
