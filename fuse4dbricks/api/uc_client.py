@@ -18,6 +18,7 @@ import httpx
 import pyfuse3
 import trio
 import urllib3
+import threading
 
 from fuse4dbricks.api.errors import (
     UcBadRequest,
@@ -880,6 +881,12 @@ class UnityCatalogClient:
         length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
+        
+        logger.info(
+            "HTTPX_WORKER_ENTER "
+            "thread=%s",
+            threading.get_ident(),
+        )
 
         t0 = time.perf_counter()
 
@@ -993,6 +1000,13 @@ class UnityCatalogClient:
         length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
+        
+        logger.info(
+            "URLLIB3_WORKER_ENTER "
+            "thread=%s",
+            threading.get_ident(),
+        )
+
 
         t0 = time.perf_counter()
 
@@ -1078,6 +1092,17 @@ class UnityCatalogClient:
             try:
                 headers = presigned.headers.copy()
                 headers.update(range_headers)
+                
+                wait_start = time.perf_counter()
+                logger.info(
+                    "DOWNLOAD_QUEUE "
+                    "thread=%s "
+                    "offset=%s "
+                    "length=%s",
+                    threading.get_ident(),
+                    offset,
+                    length,
+                )
 
                 if USE_URLLIB3_FOR_STORAGE:
 
@@ -1090,6 +1115,16 @@ class UnityCatalogClient:
                         offset == 0,
                         limiter=self._storage_limiter,
                     )
+                    
+                    logger.info(
+                        "DOWNLOAD_DISPATCH "
+                        "thread=%s "
+                        "waited=%.6fs "
+                        "offset=%s",
+                        threading.get_ident(),
+                        time.perf_counter() - wait_start,
+                        offset,
+                    )
 
                 else:
 
@@ -1101,6 +1136,16 @@ class UnityCatalogClient:
                         length,
                         offset == 0,
                         limiter=self._storage_limiter,
+                    )
+                    
+                    logger.info(
+                        "DOWNLOAD_DISPATCH "
+                        "thread=%s "
+                        "waited=%.6fs "
+                        "offset=%s",
+                        threading.get_ident(),
+                        time.perf_counter() - wait_start,
+                        offset,
                     )
                 
                 # bottleneck validation
