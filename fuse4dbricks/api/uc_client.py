@@ -898,28 +898,38 @@ class UnityCatalogClient:
             if status == 206 or (status == 200 and accept_200):
 
                 read_start = time.perf_counter()
-                
+                cpu_start = time.process_time()
+
                 chunks = []
-                
-                logger.error("MAGDA_MARKER_BEFORE_ITER")
-                
+
                 for chunk in resp.iter_bytes(chunk_size=8 * 1024 * 1024):
                     chunks.append(chunk)
-                
-                logger.error("MAGDA_MARKER_AFTER_ITER")
-                
-                sizes = [len(c) for c in chunks]
-                
-                logger.info(
-                    "HTTPX_CHUNK_STATS count=%s min=%s max=%s",
-                    len(sizes),
-                    min(sizes) if sizes else 0,
-                    max(sizes) if sizes else 0,
-                )
+
+                iter_end = time.perf_counter()
+                cpu_after_iter = time.process_time()
+
+                join_start = time.perf_counter()
 
                 body = b"".join(chunks)
 
-                read_end = time.perf_counter()
+                join_end = time.perf_counter()
+                cpu_end = time.process_time()
+
+                logger.info(
+                    "HTTPX_BREAKDOWN "
+                    "iter_wall=%.3fs "
+                    "iter_cpu=%.3fs "
+                    "join_wall=%.6fs "
+                    "join_cpu=%.6fs "
+                    "wait=%.3fs",
+                    iter_end - read_start,
+                    cpu_after_iter - cpu_start,
+                    join_end - join_start,
+                    cpu_end - cpu_after_iter,
+                    (iter_end - read_start) - (cpu_after_iter - cpu_start),
+                )
+
+                read_end = join_end
                 
                 logger.info(
                     "HTTPX_ITER chunks=%s bytes=%s took=%.3fs",
