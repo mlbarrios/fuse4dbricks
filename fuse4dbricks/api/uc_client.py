@@ -909,9 +909,21 @@ class UnityCatalogClient:
             cpu_start = time.thread_time()
 
             body = resp.content
+            
+            t2 = time.perf_counter()
 
-            read_end = time.perf_counter()
+            read_end = t2
             cpu_end = time.thread_time()
+            
+            logger.info(
+                "HTTPX_SPLIT "
+                "request=%.3fs "
+                "content=%.6fs "
+                "total=%.3fs",
+                t1 - t0,
+                t2 - t1,
+                t2 - t0,
+            )
 
             logger.info(
                 "HTTPX_BREAKDOWN "
