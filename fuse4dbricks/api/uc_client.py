@@ -260,6 +260,14 @@ class UnityCatalogClient:
                 url=url,
                 request_id=request_id,
             )
+							
+											   
+
+							   
+					
+								
+								
+						
 									  
 			 
 
@@ -873,33 +881,13 @@ class UnityCatalogClient:
         length: int,
         accept_200: bool,
     ) -> tuple[int, bytes]:
-        req_headers = headers
-        if "Accept-Encoding" not in req_headers:
-            req_headers = {**headers, "Accept-Encoding": "identity"}
-
-        with client.stream("GET", url, headers=req_headers, follow_redirects=False) as resp:
+        with client.stream("GET", url, headers=headers, follow_redirects=False) as resp:
             status = resp.status_code
             if status != 206 and not (status == 200 and accept_200):
                 return status, b""
 
-            # Preasignación de memoria exacta (zero-reallocation)
-            buf = bytearray(length)
-            view = memoryview(buf)
-            pos = 0
-
-            # iter_raw evita la capa de decodificación de httpx/httpcore
-            for chunk in resp.iter_raw(chunk_size=1024 * 1024):
-                n = len(chunk)
-                if pos + n > length:
-                    # Protección por si el servidor devuelve más bytes de los pedidos
-                    view[pos:length] = chunk[: length - pos]
-                    pos = length
-                    break
-                view[pos : pos + n] = chunk
-                pos += n
-
-            return status, bytes(buf[:pos]) if pos < length else bytes(buf)
-
+            # iter_raw() sin chunk_size desactiva ByteChunker; b"".join lo ensambla en C en una sola pasada
+            return status, b"".join(resp.iter_raw())
 
 
     @staticmethod
