@@ -73,7 +73,7 @@ _PRESIGNED_URL_REFRESH_MARGIN_S = 60
 _PRESIGNED_FAILURE_TTL_S = 60.0
 _PRESIGNED_CACHE_MAX_ENTRIES = 4096
 _PRESIGNED_DOWNLOAD_CONCURRENCY = 50
-USE_URLLIB3_FOR_STORAGE = True
+USE_URLLIB3_FOR_STORAGE = False
 
 
 @dataclass(frozen=True)
@@ -865,8 +865,8 @@ class UnityCatalogClient:
                     pool=5.0,
                 ),
                 limits=httpx.Limits(
-                    max_keepalive_connections=50,
-                    max_connections=50,
+                    max_keepalive_connections=200,
+                    max_connections=200,
                 ),
             )
 
