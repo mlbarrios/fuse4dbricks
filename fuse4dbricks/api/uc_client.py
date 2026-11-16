@@ -898,7 +898,7 @@ class UnityCatalogClient:
             if status == 206 or (status == 200 and accept_200):
 
                 read_start = time.perf_counter()
-                cpu_start = time.process_time()
+                cpu_start = time.thread_time()
 
                 chunks = []
 
@@ -906,14 +906,15 @@ class UnityCatalogClient:
                     chunks.append(chunk)
 
                 iter_end = time.perf_counter()
-                cpu_after_iter = time.process_time()
+                cpu_after_iter = time.thread_time()
+
 
                 join_start = time.perf_counter()
 
                 body = b"".join(chunks)
 
                 join_end = time.perf_counter()
-                cpu_end = time.process_time()
+                cpu_end = time.thread_time()
 
                 logger.info(
                     "HTTPX_BREAKDOWN "
