@@ -880,7 +880,7 @@ class UnityCatalogClient:
         accept_200: bool,
     ) -> tuple[int, bytes]:
 
-        USE_URLLIB3_BENCH = True
+        USE_URLLIB3_BENCH = False
 
         if USE_URLLIB3_BENCH:
 
@@ -957,41 +957,27 @@ class UnityCatalogClient:
                 read_start = time.perf_counter()
                 cpu_start = time.thread_time()
 
-                chunks = []
-
-                for chunk in resp.iter_bytes(chunk_size=8 * 1024 * 1024):
-                    chunks.append(chunk)
+                body = b"".join(resp.iter_raw())
 
                 iter_end = time.perf_counter()
                 cpu_after_iter = time.thread_time()
 
-
-                join_start = time.perf_counter()
-
-                body = b"".join(chunks)
-
-                join_end = time.perf_counter()
-                cpu_end = time.thread_time()
+                join_end = iter_end
 
                 logger.info(
                     "HTTPX_BREAKDOWN "
                     "iter_wall=%.3fs "
                     "iter_cpu=%.3fs "
-                    "join_wall=%.6fs "
-                    "join_cpu=%.6fs "
                     "wait=%.3fs",
                     iter_end - read_start,
                     cpu_after_iter - cpu_start,
-                    join_end - join_start,
-                    cpu_end - cpu_after_iter,
                     (iter_end - read_start) - (cpu_after_iter - cpu_start),
-                )
+)
 
                 read_end = join_end
                 
                 logger.info(
-                    "HTTPX_ITER chunks=%s bytes=%s took=%.3fs",
-                    len(chunks),
+                    "HTTPX_ITER bytes=%s took=%.3fs",
                     len(body),
                     read_end - read_start,
                 )
