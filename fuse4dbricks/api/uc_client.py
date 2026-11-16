@@ -898,10 +898,22 @@ class UnityCatalogClient:
             if status == 206 or (status == 200 and accept_200):
 
                 read_start = time.perf_counter()
+                
+                chunks = []
+                
+                for chunk in resp.iter_bytes():
+                    chunks.append(chunk)
 
-                body = resp.read()
+                body = b"".join(chunks)
 
                 read_end = time.perf_counter()
+                
+                logger.info(
+                    "HTTPX_ITER chunks=%s bytes=%s took=%.3fs",
+                    len(chunks),
+                    len(body),
+                    read_end - read_start,
+                )
 
                 logger.info(
                     "HTTPX_TIMING "
