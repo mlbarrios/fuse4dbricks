@@ -901,8 +901,12 @@ class UnityCatalogClient:
                 
                 chunks = []
                 
+                logger.error("MAGDA_MARKER_BEFORE_ITER")
+                
                 for chunk in resp.iter_bytes(chunk_size=8 * 1024 * 1024):
                     chunks.append(chunk)
+                
+                logger.error("MAGDA_MARKER_AFTER_ITER")
                 
                 sizes = [len(c) for c in chunks]
                 
