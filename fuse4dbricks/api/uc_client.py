@@ -17,6 +17,7 @@ from typing import AsyncGenerator
 import httpx
 import pyfuse3
 import trio
+import urllib3
 
 from fuse4dbricks.api.errors import (
     UcBadRequest,
@@ -163,6 +164,13 @@ class UnityCatalogClient:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             follow_redirects=True,
         )
+        
+        # Bottleneck
+        self._urllib3_pool = urllib3.PoolManager(
+            num_pools=50,
+            maxsize=50,
+        )
+
 
         # Presigned downloads (only used with --use-presigned-downloads).
         self._download_urls: dict[tuple[int, str], PresignedDownloadUrl] = {}
@@ -861,7 +869,8 @@ class UnityCatalogClient:
             )
 
         return self._storage_client
-
+    
+    
     @staticmethod
     def _storage_get_blocking(
         client: httpx.Client,
@@ -871,6 +880,54 @@ class UnityCatalogClient:
         accept_200: bool,
     ) -> tuple[int, bytes]:
 
+        USE_URLLIB3_BENCH = True
+
+        if USE_URLLIB3_BENCH:
+
+            http = urllib3.PoolManager()
+
+            t0 = time.perf_counter()
+            cpu0 = time.thread_time()
+
+            resp = http.request(
+                "GET",
+                url,
+                headers=headers,
+                preload_content=False,
+            )
+
+            body = resp.read()
+            resp.release_conn()
+
+            t1 = time.perf_counter()
+            cpu1 = time.thread_time()
+
+            logger.info(
+                "URLLIB3_HEADERS "
+                "content_length=%s",
+                resp.headers.get("content-length"),
+            )
+
+            logger.info(
+                "URLLIB3_BENCH "
+                "status=%s "
+                "expected=%s "
+                "returned=%s "
+                "wall=%.3fs "
+                "cpu=%.3fs "
+                "wait=%.3fs "
+                "throughput=%.1fMB/s",
+                resp.status,
+                length,
+                len(body),
+                t1 - t0,
+                cpu1 - cpu0,
+                (t1 - t0) - (cpu1 - cpu0),
+                len(body) / 1024 / 1024 / (t1 - t0),
+            )
+
+            return resp.status, body
+        
         t0 = time.perf_counter()
 
         with client.stream(
