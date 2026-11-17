@@ -18,7 +18,6 @@ import httpx
 import pyfuse3
 import trio
 import urllib3
-import threading
 
 from fuse4dbricks.api.errors import (
     UcBadRequest,
@@ -73,7 +72,6 @@ _PRESIGNED_URL_REFRESH_MARGIN_S = 60
 _PRESIGNED_FAILURE_TTL_S = 60.0
 _PRESIGNED_CACHE_MAX_ENTRIES = 4096
 _PRESIGNED_DOWNLOAD_CONCURRENCY = 50
-USE_URLLIB3_FOR_STORAGE = False
 
 
 @dataclass(frozen=True)
@@ -166,13 +164,6 @@ class UnityCatalogClient:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             follow_redirects=True,
         )
-        
-        # Bottleneck
-        self._urllib3_pool = urllib3.PoolManager(
-            num_pools=50,
-            maxsize=50,
-        )
-
 
         # Presigned downloads (only used with --use-presigned-downloads).
         self._download_urls: dict[tuple[int, str], PresignedDownloadUrl] = {}
@@ -180,13 +171,13 @@ class UnityCatalogClient:
         self._download_url_inflight: dict[tuple[int, str], trio.Event] = {}
         self._presigned_failures: dict[tuple[int, str], float] = {}
         "(uid, uc_path) -> monotonic time until which the Files API is used directly"
-        self._storage_client: httpx.Client | None = None
+        self._storage_pool: urllib3.PoolManager | None = None
         self._storage_limiter = trio.CapacityLimiter(_PRESIGNED_DOWNLOAD_CONCURRENCY)
 
     async def close(self):
         await self.client.aclose()
-        if self._storage_client is not None:
-            self._storage_client.close()
+        if self._storage_pool is not None:
+            self._storage_pool.clear()
 
     async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
         """
@@ -253,6 +244,10 @@ class UnityCatalogClient:
             raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 400:
+            print("\n===== 400 RESPONSE =====")
+            print(resp.text)
+            print("========================\n")
+
             raise UcBadRequest(
                 msg,
                 status_code=400,
@@ -853,212 +848,54 @@ class UnityCatalogClient:
             key[1], reason, _PRESIGNED_FAILURE_TTL_S,
         )
 
-    def _get_storage_client(self) -> httpx.Client:
-        if self._storage_client is None:
-            self._storage_client = httpx.Client(
-                http2=False,
-                follow_redirects=False,
-                timeout=httpx.Timeout(
-                    connect=10.0,
-                    read=60.0,
-                    write=10.0,
-                    pool=30.0,
-                ),
-                limits=httpx.Limits(
-                    max_keepalive_connections=50,
-                    max_connections=50,
-                ),
+    def _get_storage_pool(self) -> urllib3.PoolManager:
+        if self._storage_pool is None:
+            # urllib3 logs each request line, query string included, at DEBUG.
+            # The query string of a presigned URL is its signature: keep it out
+            # of --debug logs.
+            pool_logger = logging.getLogger("urllib3.connectionpool")
+            if pool_logger.level < logging.INFO:
+                pool_logger.setLevel(logging.INFO)
+            self._storage_pool = urllib3.PoolManager(
+                maxsize=_PRESIGNED_DOWNLOAD_CONCURRENCY,
+                retries=False,
+                timeout=urllib3.Timeout(connect=10.0, read=60.0),
             )
-
-        return self._storage_client
-
+        return self._storage_pool
 
     @staticmethod
     def _storage_get_blocking(
-        client: httpx.Client,
-        url: str,
-        headers: dict[str, str],
-        length: int,
-        accept_200: bool,
+        pool: urllib3.PoolManager, url: str, headers: dict[str, str], length: int, accept_200: bool
     ) -> tuple[int, bytes]:
+        """Blocking ranged GET against cloud storage; runs in a worker thread.
 
-        t0 = time.perf_counter()
-        cpu0 = time.thread_time()
-
-        resp = client.get(
-            url,
-            headers=headers,
-            follow_redirects=False,
-        )
-        
-        #request_plus_content: GET + cabeceras + descarga completa
-
-        t1 = time.perf_counter()
-
-        status = resp.status_code
-
-        if status != 206 and not (status == 200 and accept_200):
-            return status, b""
-        
-        # ya tenemos los 8M descargados en body, debería ser aprox 0
-        body = resp.content
-
-        t2 = time.perf_counter()
-        cpu1 = time.thread_time()
-
-        throughput_mb_s = (
-            len(body) / 1024 / 1024 / (t1 - t0)
-            if (t1 - t0) > 0
-            else 0
-        )
-
-        logger.info(
-            "HTTPX_GET_DOWNLOAD "
-            "status=%s "
-            "bytes=%s "
-            "request_plus_content=%.3fs "
-            "content_access=%.6fs "
-            "cpu=%.3fs "
-            "throughput=%.1fMB/s",
-            status,
-            len(body),
-            t1 - t0,
-            t2 - t1,
-            cpu1 - cpu0,
-            throughput_mb_s,
-        )
-
-        return status, body
-    
-    
-    #@staticmethod
-    #def _storage_get_blocking(
-    #    client: httpx.Client,
-    #    url: str,
-    #    headers: dict[str, str],
-    #    length: int,
-    #    accept_200: bool,
-    #) -> tuple[int, bytes]:
-#
-    #    t0 = time.perf_counter()
-    #    cpu0 = time.thread_time()
-
-    #    with client.stream(
-    #        "GET",
-    #        url,
-    #        headers=headers,
-    #        follow_redirects=False,
-    #    ) as resp:
-
-    #        t1 = time.perf_counter()
-
-    #        status = resp.status_code
-
-    #        if status != 206 and not (status == 200 and accept_200):
-    #            return status, b""
-            
-    #        # Con stream la descarga de hace en este punto
-    #        body = resp.read()
-
-    #        t2 = time.perf_counter()
-
-    #    cpu1 = time.thread_time()
-
-    #    throughput_mb_s = (
-    #        len(body) / 1024 / 1024 / (t2 - t0)
-    #        if (t2 - t0) > 0
-    #        else 0
-    #    )
-
-    #    logger.info(
-    #        "HTTPX_STREAM_DOWNLOAD "
-    #        "status=%s "
-    #        "bytes=%s "
-    #        "request=%.3fs "
-    #        "content=%.3fs "
-    #        "total=%.3fs "
-    #        "cpu=%.3fs "
-    #        "throughput=%.1fMB/s",
-    #        status,
-    #        len(body),
-    #        t1 - t0,
-    #        t2 - t1,
-    #        t2 - t0,
-    #        cpu1 - cpu0,
-    #        throughput_mb_s,
-    #    )
-
-    #    return status, body
-
-
-    @staticmethod
-    def _storage_get_blocking_urllib3(
-        pool: urllib3.PoolManager,
-        url: str,
-        headers: dict[str, str],
-        length: int,
-        accept_200: bool,
-    ) -> tuple[int, bytes]:
-        
-        logger.info(
-            "URLLIB3_WORKER_ENTER "
-            "thread=%s",
-            threading.get_ident(),
-        )
-
-
-        t0 = time.perf_counter()
-
+        Blocking reads keep the per-byte work (TLS, HTTP framing) off the Trio
+        loop, which also serves FUSE. Returns (status, body); the body is empty
+        unless the range was served, and is never longer than ``length``.
+        """
         resp = pool.request(
-            "GET",
-            url,
-            headers=headers,
-            preload_content=False,
-            redirect=False,
+            "GET", url, headers=headers, preload_content=False, decode_content=False, redirect=False
         )
+        try:
+            if resp.status == 206 or (resp.status == 200 and accept_200):
+                # Read the requested range into memory in a single operation.
+                # Unlike the Files API backend, which streams data in 64 KiB pieces through
+                # httpx, fuse4dbricks already operates on fixed-size chunks (typically 8 MiB)
+                # at the DataManager layer. Returning the whole range avoids hundreds of
+                # small async iterations per chunk and reduces Python scheduling overhead.
+                # Memory usage remains bounded by:
+                #     num_download_workers * chunk_size
+                #
+                # For example, with 10 workers and 8 MiB chunks, at most roughly 80 MiB of
+                # chunk payload can be simultaneously buffered by active downloads.
 
-        t1 = time.perf_counter()
-        cpu0 = time.thread_time()
-
-        status = resp.status
-
-        body = resp.read()
-
-        t2 = time.perf_counter()
-        
-        cpu1 = time.thread_time()
-
-        throughput_mb_s = (
-            len(body) / 1024 / 1024 / (t2 - t0)
-            if (t2 - t0) > 0
-            else 0
-        )
-
-        logger.info(
-            "URLLIB3_DOWNLOAD "
-            "status=%s "
-            "bytes=%s "
-            "expected=%s "
-            "request=%.3fs "
-            "content=%.6fs "
-            "total=%.3fs "
-            "cpu=%.3fs "
-            "throughput=%.1fMB/s",
-            status,
-            len(body),
-            length,
-            t1 - t0,
-            t2 - t1,
-            t2 - t0,
-            cpu1 - cpu0,
-            throughput_mb_s,
-        )
-
-        resp.release_conn()
-
-        return status, body
-
-
+                return resp.status, resp.read(length)
+            return resp.status, b""
+        finally:
+            # A fully read range has already returned its connection to the pool;
+            # anything unread (error bodies, a whole blob sent with 200) is dropped.
+            if not resp.closed:
+                resp.close()
 
     async def _download_range_presigned(
         self,
@@ -1069,7 +906,9 @@ class UnityCatalogClient:
         ctx: pyfuse3.RequestContext,
         if_unmodified_since: float | None,
     ) -> bytes | None:
-        """Read [offset, offset + length) directly from storage.
+        """
+        Read [offset, offset + length) directly from storage.
+
         Returns None when the caller should use the Files API instead. Nothing
         logged or raised here includes the presigned URL.
         """
@@ -1080,7 +919,7 @@ class UnityCatalogClient:
         range_headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
         if if_unmodified_since:
             range_headers["If-Unmodified-Since"] = formatdate(if_unmodified_since, usegmt=True)
-        client = self._get_storage_client()
+        pool = self._get_storage_pool()
 
         refreshed = False
         attempt = 0
@@ -1094,91 +933,23 @@ class UnityCatalogClient:
                 return None
 
             try:
-                headers = presigned.headers.copy()
-                headers.update(range_headers)
-                
-                wait_start = time.perf_counter()
-                logger.info(
-                    "DOWNLOAD_QUEUE "
-                    "thread=%s "
-                    "offset=%s "
-                    "length=%s",
-                    threading.get_ident(),
-                    offset,
+                status, body = await trio.to_thread.run_sync(
+                    self._storage_get_blocking,
+                    pool,
+                    presigned.url,
+                    {**presigned.headers, **range_headers},
                     length,
+                    offset == 0,
+                    limiter=self._storage_limiter,
                 )
-
-                if USE_URLLIB3_FOR_STORAGE:
-
-                    status, body = await trio.to_thread.run_sync(
-                        self._storage_get_blocking_urllib3,
-                        self._urllib3_pool,
-                        presigned.url,
-                        headers,
-                        length,
-                        offset == 0,
-                        limiter=self._storage_limiter,
-                    )
-                    
-                    logger.info(
-                        "DOWNLOAD_DISPATCH "
-                        "thread=%s "
-                        "waited=%.6fs "
-                        "offset=%s",
-                        threading.get_ident(),
-                        time.perf_counter() - wait_start,
-                        offset,
-                    )
-
-                else:
-
-                    status, body = await trio.to_thread.run_sync(
-                        self._storage_get_blocking,
-                        client,
-                        presigned.url,
-                        headers,
-                        length,
-                        offset == 0,
-                        limiter=self._storage_limiter,
-                    )
-                    
-                    logger.info(
-                        "DOWNLOAD_DISPATCH "
-                        "thread=%s "
-                        "waited=%.6fs "
-                        "offset=%s",
-                        threading.get_ident(),
-                        time.perf_counter() - wait_start,
-                        offset,
-                    )
-                
-                # bottleneck validation
-                logger.info(
-                    "PRESIGNED_RANGE "
-                    "offset=%s length=%s returned=%s status=%s",
-                    offset,
-                    length,
-                    len(body),
-                    status,
-                )
-                
                 failure = f"storage status {status}"
-            except httpx.HTTPError as exc:
+            except urllib3.exceptions.HTTPError as exc:
                 # Message deliberately not logged: it may contain the URL.
                 status, body = None, b""
                 failure = f"storage transport error {type(exc).__name__}"
 
             if status == 206 or (status == 200 and offset == 0):
                 if len(body) == length:
-
-                    logger.info(
-                        "DOWNLOAD_OK "
-                        "offset=%s expected=%s returned=%s",
-                        offset,
-                        length,
-                        len(body),
-                    )
-
                     return body
                 failure = f"short read ({len(body)} of {length} bytes)"
                 status = None  # retried like a transport error

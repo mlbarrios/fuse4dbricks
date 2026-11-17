@@ -166,22 +166,11 @@ def parse_args():
 
 def setup_logging(debug_mode):
     level = logging.DEBUG if debug_mode else logging.INFO
-
     logging.basicConfig(
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        level=level
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", level=level
     )
-
-    # Investigación httpx/httpcore
-    logging.getLogger("httpx").setLevel(logging.DEBUG)
-    logging.getLogger("httpcore").setLevel(logging.DEBUG)
-    logging.getLogger("httpcore.connection").setLevel(logging.DEBUG)
-
-    logging.getLogger("httpx").propagate = True
-    logging.getLogger("httpcore").propagate = True
-    logging.getLogger("httpcore.connection").propagate = True
-
     if not debug_mode:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("pyfuse3").setLevel(logging.INFO)
 
 
