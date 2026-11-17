@@ -73,7 +73,7 @@ _PRESIGNED_URL_REFRESH_MARGIN_S = 60
 _PRESIGNED_FAILURE_TTL_S = 60.0
 _PRESIGNED_CACHE_MAX_ENTRIES = 4096
 _PRESIGNED_DOWNLOAD_CONCURRENCY = 50
-USE_URLLIB3_FOR_STORAGE = True
+USE_URLLIB3_FOR_STORAGE = False
 
 
 @dataclass(frozen=True)
@@ -871,8 +871,8 @@ class UnityCatalogClient:
             )
 
         return self._storage_client
-    
-    
+
+
     @staticmethod
     def _storage_get_blocking(
         client: httpx.Client,
@@ -885,51 +885,110 @@ class UnityCatalogClient:
         t0 = time.perf_counter()
         cpu0 = time.thread_time()
 
-        with client.stream(
-            "GET",
+        resp = client.get(
             url,
             headers=headers,
             follow_redirects=False,
-        ) as resp:
+        )
+        
+        #request_plus_content: GET + cabeceras + descarga completa
 
-            t1 = time.perf_counter()
+        t1 = time.perf_counter()
 
-            status = resp.status_code
+        status = resp.status_code
 
-            if status != 206 and not (status == 200 and accept_200):
-                return status, b""
+        if status != 206 and not (status == 200 and accept_200):
+            return status, b""
+        
+        # ya tenemos los 8M descargados en body, debería ser aprox 0
+        body = resp.content
 
-            body = resp.read()
-
-            t2 = time.perf_counter()
-
+        t2 = time.perf_counter()
         cpu1 = time.thread_time()
 
         throughput_mb_s = (
-            len(body) / 1024 / 1024 / (t2 - t0)
-            if (t2 - t0) > 0
+            len(body) / 1024 / 1024 / (t1 - t0)
+            if (t1 - t0) > 0
             else 0
         )
 
         logger.info(
-            "HTTPX_STREAM_DOWNLOAD "
+            "HTTPX_GET_DOWNLOAD "
             "status=%s "
             "bytes=%s "
-            "request=%.3fs "
-            "content=%.3fs "
-            "total=%.3fs "
+            "request_plus_content=%.3fs "
+            "content_access=%.6fs "
             "cpu=%.3fs "
             "throughput=%.1fMB/s",
             status,
             len(body),
             t1 - t0,
             t2 - t1,
-            t2 - t0,
             cpu1 - cpu0,
             throughput_mb_s,
         )
 
         return status, body
+    
+    
+    #@staticmethod
+    #def _storage_get_blocking(
+    #    client: httpx.Client,
+    #    url: str,
+    #    headers: dict[str, str],
+    #    length: int,
+    #    accept_200: bool,
+    #) -> tuple[int, bytes]:
+#
+    #    t0 = time.perf_counter()
+    #    cpu0 = time.thread_time()
+
+    #    with client.stream(
+    #        "GET",
+    #        url,
+    #        headers=headers,
+    #        follow_redirects=False,
+    #    ) as resp:
+
+    #        t1 = time.perf_counter()
+
+    #        status = resp.status_code
+
+    #        if status != 206 and not (status == 200 and accept_200):
+    #            return status, b""
+            
+    #        # Con stream la descarga de hace en este punto
+    #        body = resp.read()
+
+    #        t2 = time.perf_counter()
+
+    #    cpu1 = time.thread_time()
+
+    #    throughput_mb_s = (
+    #        len(body) / 1024 / 1024 / (t2 - t0)
+    #        if (t2 - t0) > 0
+    #        else 0
+    #    )
+
+    #    logger.info(
+    #        "HTTPX_STREAM_DOWNLOAD "
+    #        "status=%s "
+    #        "bytes=%s "
+    #        "request=%.3fs "
+    #        "content=%.3fs "
+    #        "total=%.3fs "
+    #        "cpu=%.3fs "
+    #        "throughput=%.1fMB/s",
+    #        status,
+    #        len(body),
+    #        t1 - t0,
+    #        t2 - t1,
+    #        t2 - t0,
+    #        cpu1 - cpu0,
+    #        throughput_mb_s,
+    #    )
+
+    #    return status, body
 
 
     @staticmethod
